@@ -47,7 +47,7 @@ fn runFile(name: []const u8) !void {
     var buffer: [128]u8 = undefined;
     const file = std.fs.File.stdout();
     var stdout = std.fs.File.writer(file, &buffer);
-    _ = try zlox.interpretChunk(&writer.chunk(), &stdout.interface);
+    _ = try zlox.interpretChunk(alloc, &writer.chunk(), &stdout.interface);
 }
 
 fn readFileToBuffer(allocator: std.mem.Allocator, fname: []const u8) ![]u8 {

@@ -2,25 +2,36 @@
 const std = @import("std");
 
 const ValueType = enum {
-    float,
-    bool,
     nil,
+    bool,
+    float,
+    obj,
 };
 const Value = union(ValueType) {
-    float: f64,
-    bool: bool,
     nil,
+    bool: bool,
+    float: f64,
+    obj: *Object,
 
     pub fn format(self: Value, writer: *std.Io.Writer) !void {
         try switch (self) {
             .nil => writer.writeAll("nil"),
             .float => |fl| writer.print("{d}", .{fl}),
             .bool => |b| writer.writeAll(if (b) "true" else "false"),
+            .obj => |o| o.format(writer),
         };
     }
 
     fn equals(self: Value, other: Value) bool {
-        return std.meta.activeTag(self) == std.meta.activeTag(other);
+        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
+
+        // The values share the same tag. Let's check their contents.
+        return switch (self) {
+            .nil => true,
+            .float => |fl| fl == other.float,
+            .bool => |b| b == other.bool,
+            .obj => |o| o.equals(other.obj.*),
+        };
     }
 
     fn isFalsey(self: Value) bool {
@@ -35,6 +46,39 @@ const Value = union(ValueType) {
         return switch (self) {
             .float => true,
             else => false,
+        };
+    }
+
+    fn isString(self: Value) bool {
+        return switch (self) {
+            .obj => switch (self.obj.*) {
+                .string => true,
+                // else => false,
+            },
+            else => false,
+        };
+    }
+};
+
+const ObjectType = enum {
+    string,
+};
+const Object = union(ObjectType) {
+    // Unowned for now.
+    string: []const u8,
+
+    pub fn format(self: Object, writer: *std.Io.Writer) !void {
+        try switch (self) {
+            .string => |bytes| writer.writeAll(bytes),
+        };
+    }
+
+    fn equals(self: Object, other: Object) bool {
+        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
+
+        // The objects share the same tag. Let's check their contents.
+        return switch (self) {
+            .string => std.mem.eql(u8, self.string, other.string),
         };
     }
 };
@@ -78,7 +122,7 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
         .Constant => {
             const index = chunk.code[offset + 1];
             const constant = chunk.constants[index];
-            try io.print("{s} {d: >3} {d}\n", .{ "Constant", index, constant.float });
+            try io.print("{s} {d: >3} {f}\n", .{ "Constant", index, constant });
             return offset + 2;
         },
         .Return => {
@@ -142,21 +186,22 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
 
 pub const ChunkWriter = struct {
     gpa: std.mem.Allocator,
-    code: std.ArrayList(u8),
-    constants: std.ArrayList(Value),
+    code: std.ArrayList(u8) = .empty,
+    constants: std.ArrayList(Value) = .empty,
+    // Objects owned by the chunk, which share its lifetime.
+    objects: std.ArrayList(Object) = .empty,
 
     /// Deinitialize with `deinit` or use `toOwnedSlice`.
     pub fn init(gpa: std.mem.Allocator) ChunkWriter {
         return ChunkWriter{
             .gpa = gpa,
-            .code = .empty,
-            .constants = .empty,
         };
     }
 
     /// Release all allocated memory.
     pub fn deinit(self: *ChunkWriter) void {
         self.code.deinit(self.gpa);
+        self.objects.deinit(self.gpa);
         self.constants.deinit(self.gpa);
     }
 
@@ -179,6 +224,12 @@ pub const ChunkWriter = struct {
     pub fn emitOps(self: *ChunkWriter, op1: OpCode, op2: OpCode) !void {
         try self.emitOp(op1);
         try self.emitOp(op2);
+    }
+
+    pub fn emitString(self: *ChunkWriter, str: []const u8) !void {
+        const new_item_ptr = try self.objects.addOne(self.gpa);
+        new_item_ptr.* = Object{ .string = str };
+        try self.emitConstant(Value{ .obj = new_item_ptr });
     }
 
     pub fn emitConstant(self: *ChunkWriter, val: Value) !void {
@@ -209,22 +260,51 @@ test "disassemble" {
     );
 }
 
-pub fn interpretChunk(chunk: *const Chunk, io: *std.Io.Writer) !VM.Result {
+pub fn interpretChunk(alloc: std.mem.Allocator, chunk: *const Chunk, io: *std.Io.Writer) !VM.Result {
     var stack: [64]Value = undefined;
-    var vm = VM{ .io = io, .chunk = chunk, .ip = 0, .stack = &stack };
+    var vm = VM{ .alloc = alloc, .io = io, .chunk = chunk, .ip = 0, .stack = &stack };
+    defer vm.deinit();
     return vm.run();
 }
 
 const debugTraceExecution = true;
 
 pub const VM = struct {
+    alloc: std.mem.Allocator,
     io: *std.Io.Writer,
     chunk: *const Chunk,
     ip: usize,
     stack: []Value,
     stackTop: usize = 0,
 
+    // A linked list of all allocated objects.
+    objects: ?*ObjectNode = null,
+
+    const ObjectNode = struct {
+        next: ?*ObjectNode,
+        data: Object,
+    };
+
     const Result = enum { OK, CompileError, RuntimeError };
+
+    fn deinit(vm: *VM) void {
+        while (vm.objects) |n| {
+            switch (n.data) {
+                .string => {
+                    vm.alloc.free(n.data.string);
+                },
+            }
+            vm.objects = n.next;
+            vm.alloc.destroy(n);
+        }
+    }
+
+    fn obj(vm: *VM, data: Object) !*Object {
+        const node = try vm.alloc.create(ObjectNode);
+        node.* = ObjectNode{ .next = vm.objects, .data = data };
+        vm.objects = node;
+        return &node.data;
+    }
 
     fn run(vm: *VM) !Result {
         while (true) {
@@ -235,6 +315,7 @@ pub const VM = struct {
                 }
                 try vm.io.writeAll("]\n");
                 _ = disassembleInstruction(vm.chunk, vm.ip, vm.io) catch {};
+                try vm.io.flush();
             }
 
             switch (vm.op()) {
@@ -266,7 +347,18 @@ pub const VM = struct {
                     }
                     vm.push(Value{ .float = -val.float });
                 },
-                .Add => try vm.binop(.Add),
+                .Add => {
+                    if (vm.peek(0).isNumber() and vm.peek(0).isNumber()) {
+                        // Reuse logic.
+                        try vm.binop(.Add);
+                    } else if (vm.peek(0).isString() and vm.peek(0).isString()) {
+                        try vm.concatenate();
+                    } else {
+                        try vm.io.print("Operands must be two numbers or two strings!\n", .{});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    }
+                },
                 .Subtract => try vm.binop(.Subtract),
                 .Multiply => try vm.binop(.Multiply),
                 .Divide => try vm.binop(.Divide),
@@ -305,6 +397,22 @@ pub const VM = struct {
         vm.push(res);
     }
 
+    // Requires the top two values to be strings.
+    fn concatenate(vm: *VM) !void {
+        const b = vm.pop();
+        const a = vm.pop();
+
+        const first = a.obj.*.string;
+        const second = b.obj.*.string;
+        var result = try vm.alloc.alloc(u8, first.len + second.len);
+        errdefer vm.alloc.free(result);
+
+        @memcpy(result[0..first.len], first);
+        @memcpy(result[first.len..], second);
+
+        vm.push(Value{ .obj = try vm.obj(Object{ .string = result }) });
+    }
+
     /// Returns the next opcode.
     fn op(vm: *VM) OpCode {
         return @as(OpCode, @enumFromInt(vm.byte()));
@@ -339,7 +447,7 @@ test "interpretChunk" {
     const file = std.fs.File.stderr();
     var writer = std.fs.File.writer(file, &buffer);
 
-    try std.testing.expectEqual(.OK, interpretChunk(&chunk, &writer.interface));
+    try std.testing.expectEqual(.OK, interpretChunk(std.testing.allocator, &chunk, &writer.interface));
 }
 
 const TokenType = enum {
@@ -657,6 +765,11 @@ const Parser = struct {
         try parser.writer.emitConstant(Value{ .float = val });
     }
 
+    fn string(parser: *Parser) !void {
+        const source = parser.previous.source;
+        try parser.writer.emitString(source[1 .. source.len - 1]);
+    }
+
     fn literal(parser: *Parser) !void {
         switch (parser.previous.type) {
             .False => try parser.writer.emitOp(.False),
@@ -697,7 +810,7 @@ const Parser = struct {
             .EqualEqual => try parser.writer.emitOp(.Equal),
             .Greater => try parser.writer.emitOp(.Greater),
             .GreaterEqual => try parser.writer.emitOps(.Less, .Not),
-            .Less => try parser.writer.emitOp(.Greater),
+            .Less => try parser.writer.emitOp(.Less),
             .LessEqual => try parser.writer.emitOps(.Greater, .Not),
             else => {},
         }
@@ -735,6 +848,7 @@ const Parser = struct {
         return switch (typ) {
             .LeftParen => Rule{ .prefix = grouping },
             .Number => Rule{ .prec = .Term, .prefix = number },
+            .String => Rule{ .prefix = string },
             .Plus => Rule{ .prec = .Term, .infix = binary },
             .Minus => Rule{ .prec = .Term, .prefix = unary, .infix = binary },
             .Star => Rule{ .prec = .Factor, .infix = binary },
@@ -771,7 +885,9 @@ test "compile" {
     var writer = ChunkWriter.init(alloc);
     defer writer.deinit();
 
-    try std.testing.expect(try compile("!(5 - 4 > 3 * 2 == !nil)", &writer));
+    try std.testing.expect(try compile(
+        \\"st" + "ri" + "ng"
+    , &writer));
 
     var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer allocating_writer.deinit();
@@ -800,7 +916,7 @@ test "compile" {
     const file = std.fs.File.stderr();
     var stderr = std.fs.File.writer(file, &buffer);
 
-    try std.testing.expectEqual(.OK, interpretChunk(&writer.chunk(), &stderr.interface));
+    try std.testing.expectEqual(.OK, interpretChunk(alloc, &writer.chunk(), &stderr.interface));
 }
 
 pub fn interpret(source: []const u8, writer: *std.Io.Writer) !void {
@@ -810,6 +926,6 @@ pub fn interpret(source: []const u8, writer: *std.Io.Writer) !void {
     defer cWriter.deinit();
 
     if (try compile(source, &cWriter)) {
-        _ = try interpretChunk(&cWriter.chunk(), writer);
+        _ = try interpretChunk(alloc, &cWriter.chunk(), writer);
     }
 }
