@@ -60,26 +60,39 @@ const Value = union(ValueType) {
     }
 };
 
+const String = struct {
+    chars: []const u8,
+    hash: u64,
+};
+const StringHashing = struct {
+    pub fn hash(self: @This(), s: String) u64 {
+        _ = self;
+        return s.hash;
+    }
+    pub fn eql(self: @This(), a: String, b: String) bool {
+        _ = self;
+        return std.mem.eql(u8, a.chars, b.chars);
+    }
+};
+
+fn StringMap(comptime V: type) type {
+    return std.hash_map.HashMapUnmanaged(String, V, StringHashing, 80);
+}
+
 const ObjectType = enum {
     string,
 };
 const Object = union(ObjectType) {
-    // Unowned for now.
-    string: []const u8,
+    string: String,
 
     pub fn format(self: Object, writer: *std.Io.Writer) !void {
         try switch (self) {
-            .string => |bytes| writer.writeAll(bytes),
+            .string => |string| writer.writeAll(string.chars),
         };
     }
 
     fn equals(self: Object, other: Object) bool {
-        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
-
-        // The objects share the same tag. Let's check their contents.
-        return switch (self) {
-            .string => std.mem.eql(u8, self.string, other.string),
-        };
+        return std.meta.eql(self, other);
     }
 };
 
@@ -228,7 +241,10 @@ pub const ChunkWriter = struct {
 
     pub fn emitString(self: *ChunkWriter, str: []const u8) !void {
         const new_item_ptr = try self.objects.addOne(self.gpa);
-        new_item_ptr.* = Object{ .string = str };
+        new_item_ptr.* = Object{ .string = String{
+            .chars = str,
+            .hash = std.hash_map.hashString(str),
+        } };
         try self.emitConstant(Value{ .obj = new_item_ptr });
     }
 
@@ -277,6 +293,9 @@ pub const VM = struct {
     stack: []Value,
     stackTop: usize = 0,
 
+    // Interned strings.
+    strings: StringMap(void) = .empty,
+
     // A linked list of all allocated objects.
     objects: ?*ObjectNode = null,
 
@@ -288,12 +307,13 @@ pub const VM = struct {
     const Result = enum { OK, CompileError, RuntimeError };
 
     fn deinit(vm: *VM) void {
+        var keys = vm.strings.keyIterator();
+        while (keys.next()) |key| {
+            vm.alloc.free(key.chars);
+        }
+        vm.strings.deinit(vm.alloc);
+
         while (vm.objects) |n| {
-            switch (n.data) {
-                .string => {
-                    vm.alloc.free(n.data.string);
-                },
-            }
             vm.objects = n.next;
             vm.alloc.destroy(n);
         }
@@ -321,7 +341,28 @@ pub const VM = struct {
             switch (vm.op()) {
                 .Constant => {
                     const constant = vm.chunk.constants[vm.byte()];
-                    vm.push(constant);
+
+                    switch (constant) {
+                        .obj => |ref| {
+                            switch (ref.*) {
+                                .string => |str| {
+                                    // If we've already interned the string, use that instance.
+                                    if (vm.strings.getKey(str)) |string| {
+                                        try vm.pushObj(Object{ .string = string });
+                                    } else {
+                                        // Otherwise, allocate a new one.
+                                        const chars = try vm.alloc.alloc(u8, str.chars.len);
+                                        errdefer vm.alloc.free(chars);
+                                        @memcpy(chars, str.chars);
+                                        const string = String{ .chars = chars, .hash = str.hash };
+                                        try vm.strings.put(vm.alloc, string, undefined);
+                                        try vm.pushObj(Object{ .string = string });
+                                    }
+                                },
+                            }
+                        },
+                        else => vm.push(constant),
+                    }
                 },
                 .Nil => vm.push(.nil),
                 .True => vm.push(Value{ .bool = true }),
@@ -402,15 +443,26 @@ pub const VM = struct {
         const b = vm.pop();
         const a = vm.pop();
 
-        const first = a.obj.*.string;
-        const second = b.obj.*.string;
+        const first = a.obj.*.string.chars;
+        const second = b.obj.*.string.chars;
         var result = try vm.alloc.alloc(u8, first.len + second.len);
         errdefer vm.alloc.free(result);
 
         @memcpy(result[0..first.len], first);
         @memcpy(result[first.len..], second);
 
-        vm.push(Value{ .obj = try vm.obj(Object{ .string = result }) });
+        const string = String{
+            .chars = result,
+            .hash = std.hash_map.hashString(result),
+        };
+
+        const entry = try vm.strings.getOrPut(vm.alloc, string);
+        if (entry.found_existing) {
+            // Free old allocation.
+            std.debug.print("Found string {s}!\n", .{entry.key_ptr.*.chars});
+            vm.alloc.free(result);
+        }
+        try vm.pushObj(Object{ .string = entry.key_ptr.* });
     }
 
     /// Returns the next opcode.
@@ -431,6 +483,10 @@ pub const VM = struct {
     fn push(vm: *VM, val: Value) void {
         vm.stack[vm.stackTop] = val;
         vm.stackTop += 1;
+    }
+
+    fn pushObj(vm: *VM, object: Object) !void {
+        vm.push(Value{ .obj = try vm.obj(object) });
     }
 
     fn pop(vm: *VM) Value {
@@ -886,31 +942,11 @@ test "compile" {
     defer writer.deinit();
 
     try std.testing.expect(try compile(
-        \\"st" + "ri" + "ng"
+        \\"st" == "s" + "t"
     , &writer));
 
     var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer allocating_writer.deinit();
-
-    // try writer.chunk().disassemble("test", &allocating_writer.writer);
-    // try std.testing.expectEqualStrings(
-    //     \\== test ==
-    //     \\0000 Constant   0 5
-    //     \\0002 Constant   1 4
-    //     \\0004 Subtract
-    //     \\0005 Constant   2 3
-    //     \\0007 Constant   3 2
-    //     \\0009 Multiply
-    //     \\0010 Nil
-    //     \\0011 Not
-    //     \\0012 Not
-    //     \\0013 Return
-    //     \\
-    // ,
-    //     allocating_writer.written(),
-    // );
-
-    // try std.testing.expectEqualSlices(u8, writer.code.items, &[_]u8{ 1, 0, 2, 1, 1, 5, 1, 2, 1, 3, 6, 3, 0 });
 
     var buffer: [128]u8 = undefined;
     const file = std.fs.File.stderr();
