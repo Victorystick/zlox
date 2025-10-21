@@ -142,6 +142,8 @@ const OpCode = enum(u8) {
     DefineGlobal,
     SetGlobal,
     GetGlobal,
+    SetLocal,
+    GetLocal,
     _,
 };
 
@@ -193,6 +195,16 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
             const index = chunk.code[offset + 1];
             const constant = chunk.constants[index];
             try io.print("{s} {d: >3} {f}\n", .{ "SetGlobal   ", index, constant });
+            return offset + 2;
+        },
+        .GetLocal => {
+            const index = chunk.code[offset + 1];
+            try io.print("{s} {d: >3}\n", .{ "GetLocal    ", index });
+            return offset + 2;
+        },
+        .SetLocal => {
+            const index = chunk.code[offset + 1];
+            try io.print("{s} {d: >3}\n", .{ "SetLocal    ", index });
             return offset + 2;
         },
         .Return => {
@@ -474,6 +486,12 @@ pub const VM = struct {
                         return .RuntimeError;
                     }
                 },
+                .SetLocal => {
+                    vm.stack[vm.byte()] = vm.peek(0);
+                },
+                .GetLocal => {
+                    vm.push(vm.stack[vm.byte()]);
+                },
                 .Nil => vm.push(.nil),
                 .True => vm.push(Value{ .bool = true }),
                 .False => vm.push(Value{ .bool = false }),
@@ -529,6 +547,7 @@ pub const VM = struct {
             }
         }
 
+        try vm.io.flush();
         return .OK;
     }
 
@@ -573,7 +592,6 @@ pub const VM = struct {
         const entry = try vm.strings.getOrPut(vm.alloc, string);
         if (entry.found_existing) {
             // Free old allocation.
-            // std.debug.print("Found string {s}!\n", .{entry.key_ptr.*.chars});
             vm.alloc.free(result);
         }
         try vm.pushObj(Object{ .string = entry.key_ptr.* });
@@ -851,8 +869,85 @@ fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
+const Local = struct {
+    name: Token,
+    depth: i32,
+};
+
+const Compiler = struct {
+    const Self = @This();
+
+    locals: [128]Local = undefined,
+    localCount: u8 = 0,
+    scopeDepth: i32 = 0,
+
+    fn pop(self: *Self) u8 {
+        self.scopeDepth -= 1;
+        var count: u8 = 0;
+        while (self.localCount > 0 and self.locals[self.localCount - 1].depth > self.scopeDepth) : (self.localCount -= 1) {
+            count += 1;
+        }
+        return count;
+    }
+
+    fn addLocal(self: *Self, name: Token) !void {
+        if (self.localCount == self.locals.len - 1) {
+            return error.TooManyLocals;
+        }
+        var local = &self.locals[self.localCount];
+        local.name = name;
+        local.depth = -1;
+        self.localCount += 1;
+    }
+
+    fn markInitialized(self: *Self) void {
+        self.locals[self.localCount - 1].depth = self.scopeDepth;
+    }
+
+    fn resolveLocal(self: *Self, name: Token) error{ReadInInitializer}!?u8 {
+        if (self.localCount == 0) return null;
+
+        var i: i32 = self.localCount - 1;
+        while (i >= 0) : (i -= 1) {
+            const local = self.locals[@intCast(i)];
+
+            if (std.mem.eql(u8, name.source, local.name.source)) {
+                if (local.depth == -1) {
+                    return error.ReadInInitializer;
+                    // Uninitialized.
+                    // return null;
+                }
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    fn definesInSubscope(self: *Self, name: Token) bool {
+        if (self.localCount == 0) return false;
+
+        var i: i32 = self.localCount - 1;
+        while (i >= 0) : (i -= 1) {
+            const local = self.locals[@intCast(i)];
+            if (local.depth != -1 and local.depth < self.scopeDepth) break;
+
+            if (std.mem.eql(u8, name.source, local.name.source)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+const ParseError = error{
+    OutOfMemory,
+    TooManyLocals,
+    InvalidCharacter,
+};
+
 const Parser = struct {
     scanner: Scanner,
+    compiler: Compiler = .{},
     writer: *ChunkWriter,
     current: Token = Token{
         .type = .Error,
@@ -1017,7 +1112,21 @@ const Parser = struct {
 
     fn parseVariable(parser: *Parser, err: []const u8) !u8 {
         parser.consume(.Identifier, err);
+
+        try parser.declareVariable();
+        if (parser.compiler.scopeDepth > 0) return 0;
+
         return try parser.identifierConstant(parser.previous);
+    }
+
+    fn declareVariable(parser: *Parser) !void {
+        if (parser.compiler.scopeDepth == 0) return;
+
+        if (parser.compiler.definesInSubscope(parser.previous)) {
+            parser.errorAt(parser.previous, "Already a variable with this name in this scope.");
+        }
+
+        try parser.compiler.addLocal(parser.previous);
     }
 
     fn expression(parser: *Parser) !void {
@@ -1036,8 +1145,31 @@ const Parser = struct {
         try parser.writer.emitOp(.Pop);
     }
 
+    fn block(parser: *Parser) !void {
+        while (!parser.check(.RightBrace) and !parser.check(.Eof)) {
+            try parser.declaration();
+        }
+        parser.consume(.RightBrace, "Expect '}' after block.");
+    }
+
+    fn beginScope(parser: *Parser) void {
+        parser.compiler.scopeDepth += 1;
+    }
+
+    fn endScope(parser: *Parser) !void {
+        const localCount = parser.compiler.pop();
+
+        for (0..localCount) |_| {
+            try parser.writer.emitOp(.Pop);
+        }
+    }
+
     fn statement(parser: *Parser) !void {
-        if (parser.match(.Print)) {
+        if (parser.match(.LeftBrace)) {
+            parser.beginScope();
+            try parser.block();
+            try parser.endScope();
+        } else if (parser.match(.Print)) {
             try parser.printStatement();
         } else {
             try parser.expressionStatement();
@@ -1054,11 +1186,20 @@ const Parser = struct {
         }
         parser.consume(.Semicolon, "Expect ';' after variable declaration.");
 
+        try parser.defineVariable(global);
+    }
+
+    fn defineVariable(parser: *Parser, global: u8) !void {
+        if (parser.compiler.scopeDepth > 0) {
+            parser.compiler.markInitialized();
+            return;
+        }
+
         try parser.writer.emitOp(.DefineGlobal);
         try parser.writer.emit(global);
     }
 
-    fn declaration(parser: *Parser) !void {
+    fn declaration(parser: *Parser) ParseError!void {
         if (parser.match(.Var)) {
             try parser.varDeclaration();
         } else {
@@ -1088,13 +1229,28 @@ const Parser = struct {
     }
 
     fn namedVariable(parser: *Parser, token: Token, canAssign: bool) !void {
-        const index = try parser.identifierConstant(token);
+        var get: OpCode = .GetGlobal;
+        var set: OpCode = .SetGlobal;
+        var index: u8 = 0;
+
+        const res = parser.compiler.resolveLocal(token) catch {
+            parser.errorAt(token, "Can't read local variable in its own initializer.");
+            return;
+        };
+
+        if (res) |i| {
+            index = i;
+            get = .GetLocal;
+            set = .SetLocal;
+        } else {
+            index = try parser.identifierConstant(token);
+        }
 
         if (canAssign and parser.match(.Equal)) {
             try parser.expression();
-            try parser.writer.emitOp(.SetGlobal);
+            try parser.writer.emitOp(set);
         } else {
-            try parser.writer.emitOp(.GetGlobal);
+            try parser.writer.emitOp(get);
         }
         try parser.writer.emit(index);
     }
@@ -1164,7 +1320,7 @@ pub fn compile(source: []const u8, writer: *ChunkWriter) !bool {
 //     try std.testing.expectEqual(.OK, interpretChunk(alloc, &writer.chunk(), &stderr.interface));
 // }
 
-fn run(source: []const u8) !void {
+fn run(name: []const u8, source: []const u8) !void {
     const alloc = std.testing.allocator;
 
     var writer = ChunkWriter.init(alloc);
@@ -1180,30 +1336,36 @@ fn run(source: []const u8) !void {
     var stderr = std.fs.File.writer(file, &buffer);
 
     const chunk = writer.chunk();
-    try chunk.disassemble("print example", &stderr.interface);
+    try chunk.disassemble(name, &stderr.interface);
 
     try std.testing.expectEqual(.OK, interpretChunk(alloc, &writer.chunk(), &stderr.interface));
 }
 
 test "re-assign variable" {
-    try run(
+    try run("reassign",
         \\var a = 1;
         \\a = 3;
         \\print a;
     );
 }
 
-// test "bad parse" {
-//     try run(
-//         \\a + b = c + d;
-//     );
-// }
-
 test "print variable" {
-    try run(
+    try run("concat",
         \\var beverage = "cafe au lait";
         \\var breakfast = "beignets with " + beverage;
         \\print breakfast;
+    );
+}
+
+test "print block" {
+    try run("block",
+        \\var a = 1;
+        \\{
+        \\  var a = 2;
+        \\  a = 3;
+        \\  print a;
+        \\}
+        \\print a;
     );
 }
 
