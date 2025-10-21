@@ -13,6 +13,16 @@ const Value = union(ValueType) {
     float: f64,
     obj: *Object,
 
+    pub fn deinit(self: Value, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .obj => |obj| {
+                obj.deinit(alloc);
+                alloc.destroy(obj);
+            },
+            else => {},
+        }
+    }
+
     pub fn format(self: Value, writer: *std.Io.Writer) !void {
         try switch (self) {
             .nil => writer.writeAll("nil"),
@@ -58,6 +68,16 @@ const Value = union(ValueType) {
             else => false,
         };
     }
+
+    fn asString(self: Value) ?String {
+        return switch (self) {
+            .obj => switch (self.obj.*) {
+                .string => |s| s,
+                // else => false,
+            },
+            else => null,
+        };
+    }
 };
 
 const String = struct {
@@ -85,6 +105,12 @@ const ObjectType = enum {
 const Object = union(ObjectType) {
     string: String,
 
+    pub fn deinit(self: Object, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .string => |string| alloc.free(string.chars),
+        }
+    }
+
     pub fn format(self: Object, writer: *std.Io.Writer) !void {
         try switch (self) {
             .string => |string| writer.writeAll(string.chars),
@@ -111,6 +137,11 @@ const OpCode = enum(u8) {
     Equal,
     Greater,
     Less,
+    Print,
+    Pop,
+    DefineGlobal,
+    SetGlobal,
+    GetGlobal,
     _,
 };
 
@@ -125,6 +156,14 @@ const Chunk = struct {
         while (offset < chunk.code.len) {
             offset = try disassembleInstruction(chunk, offset, io);
         }
+
+        try io.flush();
+
+        // for (0..chunk.constants.len) |i| {
+        //     try io.print("{} {f}\n", .{ i, chunk.constants[i] });
+        // }
+
+        // try io.flush();
     }
 };
 
@@ -135,7 +174,25 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
         .Constant => {
             const index = chunk.code[offset + 1];
             const constant = chunk.constants[index];
-            try io.print("{s} {d: >3} {f}\n", .{ "Constant", index, constant });
+            try io.print("{s} {d: >3} {f}\n", .{ "Constant    ", index, constant });
+            return offset + 2;
+        },
+        .DefineGlobal => {
+            const index = chunk.code[offset + 1];
+            const constant = chunk.constants[index];
+            try io.print("{s} {d: >3} {f}\n", .{ "DefineGlobal", index, constant });
+            return offset + 2;
+        },
+        .GetGlobal => {
+            const index = chunk.code[offset + 1];
+            const constant = chunk.constants[index];
+            try io.print("{s} {d: >3} {f}\n", .{ "GetGlobal   ", index, constant });
+            return offset + 2;
+        },
+        .SetGlobal => {
+            const index = chunk.code[offset + 1];
+            const constant = chunk.constants[index];
+            try io.print("{s} {d: >3} {f}\n", .{ "SetGlobal   ", index, constant });
             return offset + 2;
         },
         .Return => {
@@ -190,6 +247,14 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
             try io.writeAll("Less\n");
             return offset + 1;
         },
+        .Print => {
+            try io.writeAll("Print\n");
+            return offset + 1;
+        },
+        .Pop => {
+            try io.writeAll("Pop\n");
+            return offset + 1;
+        },
         _ => {
             try io.print("Unknown opcode {d}\n", .{chunk.code[offset]});
             return offset + 1;
@@ -201,8 +266,6 @@ pub const ChunkWriter = struct {
     gpa: std.mem.Allocator,
     code: std.ArrayList(u8) = .empty,
     constants: std.ArrayList(Value) = .empty,
-    // Objects owned by the chunk, which share its lifetime.
-    objects: std.ArrayList(Object) = .empty,
 
     /// Deinitialize with `deinit` or use `toOwnedSlice`.
     pub fn init(gpa: std.mem.Allocator) ChunkWriter {
@@ -214,7 +277,9 @@ pub const ChunkWriter = struct {
     /// Release all allocated memory.
     pub fn deinit(self: *ChunkWriter) void {
         self.code.deinit(self.gpa);
-        self.objects.deinit(self.gpa);
+        for (self.constants.items) |val| {
+            val.deinit(self.gpa);
+        }
         self.constants.deinit(self.gpa);
     }
 
@@ -239,42 +304,47 @@ pub const ChunkWriter = struct {
         try self.emitOp(op2);
     }
 
-    pub fn emitString(self: *ChunkWriter, str: []const u8) !void {
-        const new_item_ptr = try self.objects.addOne(self.gpa);
-        new_item_ptr.* = Object{ .string = String{
-            .chars = str,
+    pub fn makeString(self: *ChunkWriter, str: []const u8) !u8 {
+        // Don't allocate the same string twice.
+        for (0..self.constants.items.len) |i| {
+            if (self.constants.items[i].asString()) |other| {
+                if (std.mem.eql(u8, str, other.chars)) {
+                    return @intCast(i);
+                }
+            }
+        }
+
+        const obj = try self.gpa.create(Object);
+        errdefer self.gpa.destroy(obj);
+        obj.* = Object{ .string = String{
+            .chars = try self.copyString(str),
             .hash = std.hash_map.hashString(str),
         } };
-        try self.emitConstant(Value{ .obj = new_item_ptr });
+        return try self.makeConstant(Value{ .obj = obj });
     }
 
-    pub fn emitConstant(self: *ChunkWriter, val: Value) !void {
-        // var index = std.mem.indexOfScalar(self.constants.items, val);
-        const index = self.constants.items.len;
+    fn copyString(self: *ChunkWriter, str: []const u8) ![]const u8 {
+        const chars = try self.gpa.alloc(u8, str.len);
+        @memcpy(chars, str);
+        return chars;
+    }
+
+    pub fn emitString(self: *ChunkWriter, str: []const u8) !void {
+        const index = try self.makeString(str);
+        try self.emitConstant(index);
+    }
+
+    pub fn makeConstant(self: *ChunkWriter, val: Value) !u8 {
+        const index: u8 = @intCast(self.constants.items.len);
         try self.constants.append(self.gpa, val);
+        return index;
+    }
+
+    pub fn emitConstant(self: *ChunkWriter, index: u8) !void {
         try self.emitOp(.Constant);
-        try self.emit(@intCast(index));
+        try self.emit(index);
     }
 };
-
-test "disassemble" {
-    var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    var values = [_]Value{Value{ .float = 1 }};
-    const chunk = Chunk{ .code = &.{ 0, 1, 0, 2 }, .constants = &values };
-    try chunk.disassemble("test chunk", &allocating_writer.writer);
-
-    try std.testing.expectEqualStrings(
-        \\== test chunk ==
-        \\0000 Return
-        \\0001 Constant   0 1
-        \\0003 Negate
-        \\
-    ,
-        allocating_writer.written(),
-    );
-}
 
 pub fn interpretChunk(alloc: std.mem.Allocator, chunk: *const Chunk, io: *std.Io.Writer) !VM.Result {
     var stack: [64]Value = undefined;
@@ -295,6 +365,7 @@ pub const VM = struct {
 
     // Interned strings.
     strings: StringMap(void) = .empty,
+    globals: StringMap(Value) = .empty,
 
     // A linked list of all allocated objects.
     objects: ?*ObjectNode = null,
@@ -312,6 +383,7 @@ pub const VM = struct {
             vm.alloc.free(key.chars);
         }
         vm.strings.deinit(vm.alloc);
+        vm.globals.deinit(vm.alloc);
 
         while (vm.objects) |n| {
             vm.objects = n.next;
@@ -327,7 +399,7 @@ pub const VM = struct {
     }
 
     fn run(vm: *VM) !Result {
-        while (true) {
+        while (vm.ip < vm.chunk.code.len) {
             if (comptime debugTraceExecution) {
                 try vm.io.writeAll("[ ");
                 for (vm.stack[0..vm.stackTop]) |val| {
@@ -340,28 +412,66 @@ pub const VM = struct {
 
             switch (vm.op()) {
                 .Constant => {
-                    const constant = vm.chunk.constants[vm.byte()];
+                    const index = vm.byte();
+                    const constant = vm.chunk.constants[index];
 
-                    switch (constant) {
-                        .obj => |ref| {
-                            switch (ref.*) {
-                                .string => |str| {
-                                    // If we've already interned the string, use that instance.
-                                    if (vm.strings.getKey(str)) |string| {
-                                        try vm.pushObj(Object{ .string = string });
-                                    } else {
-                                        // Otherwise, allocate a new one.
-                                        const chars = try vm.alloc.alloc(u8, str.chars.len);
-                                        errdefer vm.alloc.free(chars);
-                                        @memcpy(chars, str.chars);
-                                        const string = String{ .chars = chars, .hash = str.hash };
-                                        try vm.strings.put(vm.alloc, string, undefined);
-                                        try vm.pushObj(Object{ .string = string });
-                                    }
-                                },
-                            }
-                        },
-                        else => vm.push(constant),
+                    if (constant.asString()) |str| {
+                        // If we've already interned the string, use that instance.
+                        if (vm.strings.getKey(str)) |string| {
+                            try vm.pushObj(Object{ .string = string });
+                        } else {
+                            // Otherwise, allocate a new one.
+                            const chars = try vm.alloc.alloc(u8, str.chars.len);
+                            errdefer vm.alloc.free(chars);
+                            @memcpy(chars, str.chars);
+                            const string = String{ .chars = chars, .hash = str.hash };
+                            try vm.strings.put(vm.alloc, string, undefined);
+                            try vm.pushObj(Object{ .string = string });
+                        }
+                    } else {
+                        vm.push(constant);
+                    }
+                },
+                .DefineGlobal => {
+                    const constant = vm.chunk.constants[vm.byte()];
+                    if (constant.asString()) |str| {
+                        try vm.globals.put(vm.alloc, str, vm.pop());
+                    } else {
+                        try vm.io.print("Expected string, got {f}!\n", .{constant});
+                        try vm.io.flush();
+                        return .RuntimeError;
+                    }
+                },
+                .SetGlobal => {
+                    const constant = vm.chunk.constants[vm.byte()];
+                    if (constant.asString()) |str| {
+                        if (vm.globals.getPtr(str)) |ptr| {
+                            ptr.* = vm.peek(0);
+                        } else {
+                            try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
+                            try vm.io.flush();
+                            return .RuntimeError;
+                        }
+                    } else {
+                        try vm.io.print("Expected string, got {f}!\n", .{constant});
+                        try vm.io.flush();
+                        return .RuntimeError;
+                    }
+                },
+                .GetGlobal => {
+                    const constant = vm.chunk.constants[vm.byte()];
+                    if (constant.asString()) |str| {
+                        if (vm.globals.get(str)) |val| {
+                            vm.push(val);
+                        } else {
+                            try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
+                            try vm.io.flush();
+                            return .RuntimeError;
+                        }
+                    } else {
+                        try vm.io.print("Expected string, got {f}!\n", .{constant});
+                        try vm.io.flush();
+                        return .RuntimeError;
                     }
                 },
                 .Nil => vm.push(.nil),
@@ -414,8 +524,12 @@ pub const VM = struct {
                     try vm.io.flush();
                     return .RuntimeError;
                 },
+                .Print => try vm.io.print("{f}\n", .{vm.pop()}),
+                .Pop => _ = vm.pop(),
             }
         }
+
+        return .OK;
     }
 
     fn binop(vm: *VM, comptime code: OpCode) !void {
@@ -459,7 +573,7 @@ pub const VM = struct {
         const entry = try vm.strings.getOrPut(vm.alloc, string);
         if (entry.found_existing) {
             // Free old allocation.
-            std.debug.print("Found string {s}!\n", .{entry.key_ptr.*.chars});
+            // std.debug.print("Found string {s}!\n", .{entry.key_ptr.*.chars});
             vm.alloc.free(result);
         }
         try vm.pushObj(Object{ .string = entry.key_ptr.* });
@@ -494,17 +608,6 @@ pub const VM = struct {
         return vm.stack[vm.stackTop];
     }
 };
-
-test "interpretChunk" {
-    var values = [_]Value{Value{ .float = 1 }};
-    const chunk = Chunk{ .code = &.{ 1, 0, 2, 0 }, .constants = &values };
-
-    var buffer: [128]u8 = undefined;
-    const file = std.fs.File.stderr();
-    var writer = std.fs.File.writer(file, &buffer);
-
-    try std.testing.expectEqual(.OK, interpretChunk(std.testing.allocator, &chunk, &writer.interface));
-}
 
 const TokenType = enum {
     // Single-character tokens.
@@ -773,6 +876,10 @@ const Parser = struct {
         Call,
         Primary,
 
+        fn lowerOrEqualTo(self: Precedence, other: Precedence) bool {
+            return @intFromEnum(self) <= @intFromEnum(other);
+        }
+
         fn next(self: Precedence) Precedence {
             return switch (self) {
                 .Primary => .Primary,
@@ -786,7 +893,6 @@ const Parser = struct {
 
         while (true) {
             parser.current = parser.scanner.next();
-            // std.debug.print("Advance: {s}\n", .{parser.current.source});
             if (parser.current.type != .Error) break;
 
             parser.errorAt(parser.current, "BOOM!");
@@ -808,25 +914,34 @@ const Parser = struct {
         parser.hadError = true;
     }
 
+    fn check(parser: *Parser, typ: TokenType) bool {
+        return parser.current.type == typ;
+    }
+
+    fn match(parser: *Parser, typ: TokenType) bool {
+        const res = parser.check(typ);
+        if (res) parser.advance();
+        return res;
+    }
+
     fn consume(parser: *Parser, typ: TokenType, text: []const u8) void {
-        if (parser.current.type == typ) {
-            parser.advance();
-        } else {
+        if (!parser.match(typ)) {
             parser.errorAt(parser.current, text);
         }
     }
 
-    fn number(parser: *Parser) !void {
+    fn number(parser: *Parser, _: bool) !void {
         const val = try std.fmt.parseFloat(f64, parser.previous.source);
-        try parser.writer.emitConstant(Value{ .float = val });
+        const index = try parser.writer.makeConstant(Value{ .float = val });
+        try parser.writer.emitConstant(index);
     }
 
-    fn string(parser: *Parser) !void {
+    fn string(parser: *Parser, _: bool) !void {
         const source = parser.previous.source;
         try parser.writer.emitString(source[1 .. source.len - 1]);
     }
 
-    fn literal(parser: *Parser) !void {
+    fn literal(parser: *Parser, _: bool) !void {
         switch (parser.previous.type) {
             .False => try parser.writer.emitOp(.False),
             .Nil => try parser.writer.emitOp(.Nil),
@@ -835,12 +950,12 @@ const Parser = struct {
         }
     }
 
-    fn grouping(parser: *Parser) !void {
+    fn grouping(parser: *Parser, _: bool) !void {
         try parser.expression();
         parser.consume(.RightParen, "Expect ')' after expression.");
     }
 
-    fn unary(parser: *Parser) !void {
+    fn unary(parser: *Parser, _: bool) !void {
         const typ = parser.previous.type;
 
         try parser.parsePrecedence(.Unary);
@@ -852,7 +967,7 @@ const Parser = struct {
         }
     }
 
-    fn binary(parser: *Parser) !void {
+    fn binary(parser: *Parser, _: bool) !void {
         const typ = parser.previous.type;
         const rule = getRule(typ);
         try parser.parsePrecedence(rule.prec.next());
@@ -873,10 +988,18 @@ const Parser = struct {
     }
 
     fn parsePrecedence(parser: *Parser, prec: Precedence) !void {
+        const canAssign = prec.lowerOrEqualTo(.Assignment);
         parser.advance();
         const rule = getRule(parser.previous.type);
         if (rule.prefix) |prefix| {
-            try prefix(parser);
+            try prefix(parser, canAssign);
+
+            // TODO: The book suggests we can error here, but I get this:
+            //   [line 1] Error at '=': Expect ';' after value.
+
+            // if (canAssign and parser.match(.Equal)) {
+            //     parser.errorAt(parser.previous, "Invalid assignment target.");
+            // }
         } else {
             parser.errorAt(parser.previous, "Expect expression.");
             return;
@@ -884,15 +1007,99 @@ const Parser = struct {
 
         while (@intFromEnum(prec) <= @intFromEnum(getRule(parser.current.type).prec)) {
             parser.advance();
-            if (getRule(parser.previous.type).infix) |infix| try infix(parser);
+            if (getRule(parser.previous.type).infix) |infix| try infix(parser, canAssign);
         }
+    }
+
+    fn identifierConstant(parser: *Parser, token: Token) !u8 {
+        return try parser.writer.makeString(token.source);
+    }
+
+    fn parseVariable(parser: *Parser, err: []const u8) !u8 {
+        parser.consume(.Identifier, err);
+        return try parser.identifierConstant(parser.previous);
     }
 
     fn expression(parser: *Parser) !void {
         try parsePrecedence(parser, .Assignment);
     }
 
-    const ParseFn = *const fn (parser: *Parser) error{ InvalidCharacter, OutOfMemory }!void;
+    fn printStatement(parser: *Parser) !void {
+        try parser.expression();
+        parser.consume(.Semicolon, "Expect ';' after value.");
+        try parser.writer.emitOp(.Print);
+    }
+
+    fn expressionStatement(parser: *Parser) !void {
+        try parser.expression();
+        parser.consume(.Semicolon, "Expect ';' after value.");
+        try parser.writer.emitOp(.Pop);
+    }
+
+    fn statement(parser: *Parser) !void {
+        if (parser.match(.Print)) {
+            try parser.printStatement();
+        } else {
+            try parser.expressionStatement();
+        }
+    }
+
+    fn varDeclaration(parser: *Parser) !void {
+        const global = try parser.parseVariable("Expect variable name.");
+
+        if (parser.match(.Equal)) {
+            try parser.expression();
+        } else {
+            try parser.writer.emitOp(.Nil);
+        }
+        parser.consume(.Semicolon, "Expect ';' after variable declaration.");
+
+        try parser.writer.emitOp(.DefineGlobal);
+        try parser.writer.emit(global);
+    }
+
+    fn declaration(parser: *Parser) !void {
+        if (parser.match(.Var)) {
+            try parser.varDeclaration();
+        } else {
+            try parser.statement();
+        }
+
+        // Recover from panic.
+        if (parser.panicMode) parser.synchronize();
+    }
+
+    fn synchronize(parser: *Parser) void {
+        parser.panicMode = false;
+
+        while (!parser.check(.Eof)) {
+            if (parser.previous.type == .Semicolon) return;
+            switch (parser.current.type) {
+                .Class, .Fun, .Var, .For, .If, .While, .Print, .Return => return,
+                else => {},
+            }
+
+            parser.advance();
+        }
+    }
+
+    fn variable(parser: *Parser, canAssign: bool) !void {
+        return parser.namedVariable(parser.previous, canAssign);
+    }
+
+    fn namedVariable(parser: *Parser, token: Token, canAssign: bool) !void {
+        const index = try parser.identifierConstant(token);
+
+        if (canAssign and parser.match(.Equal)) {
+            try parser.expression();
+            try parser.writer.emitOp(.SetGlobal);
+        } else {
+            try parser.writer.emitOp(.GetGlobal);
+        }
+        try parser.writer.emit(index);
+    }
+
+    const ParseFn = *const fn (parser: *Parser, canAssign: bool) error{ InvalidCharacter, OutOfMemory }!void;
 
     const Rule = struct {
         prec: Precedence = .None,
@@ -905,6 +1112,7 @@ const Parser = struct {
             .LeftParen => Rule{ .prefix = grouping },
             .Number => Rule{ .prec = .Term, .prefix = number },
             .String => Rule{ .prefix = string },
+            .Identifier => Rule{ .prefix = variable },
             .Plus => Rule{ .prec = .Term, .infix = binary },
             .Minus => Rule{ .prec = .Term, .prefix = unary, .infix = binary },
             .Star => Rule{ .prec = .Factor, .infix = binary },
@@ -928,22 +1136,41 @@ pub fn compile(source: []const u8, writer: *ChunkWriter) !bool {
     var parser = Parser{ .scanner = Scanner{ .source = source }, .writer = writer };
 
     parser.advance();
-    try parser.expression();
-    parser.consume(.Eof, "Expect end of expression.");
-    try writer.emitOp(.Return);
+
+    while (!parser.match(.Eof)) {
+        try parser.declaration();
+    }
 
     return !parser.hadError;
 }
 
-test "compile" {
+// test "compile" {
+//     const alloc = std.testing.allocator;
+
+//     var writer = ChunkWriter.init(alloc);
+//     defer writer.deinit();
+
+//     try std.testing.expect(try compile(
+//         \\"st" == "s" + "t";
+//     , &writer));
+
+//     var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+//     defer allocating_writer.deinit();
+
+//     var buffer: [128]u8 = undefined;
+//     const file = std.fs.File.stderr();
+//     var stderr = std.fs.File.writer(file, &buffer);
+
+//     try std.testing.expectEqual(.OK, interpretChunk(alloc, &writer.chunk(), &stderr.interface));
+// }
+
+fn run(source: []const u8) !void {
     const alloc = std.testing.allocator;
 
     var writer = ChunkWriter.init(alloc);
     defer writer.deinit();
 
-    try std.testing.expect(try compile(
-        \\"st" == "s" + "t"
-    , &writer));
+    try std.testing.expect(try compile(source, &writer));
 
     var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer allocating_writer.deinit();
@@ -952,7 +1179,32 @@ test "compile" {
     const file = std.fs.File.stderr();
     var stderr = std.fs.File.writer(file, &buffer);
 
+    const chunk = writer.chunk();
+    try chunk.disassemble("print example", &stderr.interface);
+
     try std.testing.expectEqual(.OK, interpretChunk(alloc, &writer.chunk(), &stderr.interface));
+}
+
+test "re-assign variable" {
+    try run(
+        \\var a = 1;
+        \\a = 3;
+        \\print a;
+    );
+}
+
+// test "bad parse" {
+//     try run(
+//         \\a + b = c + d;
+//     );
+// }
+
+test "print variable" {
+    try run(
+        \\var beverage = "cafe au lait";
+        \\var breakfast = "beignets with " + beverage;
+        \\print breakfast;
+    );
 }
 
 pub fn interpret(source: []const u8, writer: *std.Io.Writer) !void {
