@@ -144,6 +144,10 @@ const OpCode = enum(u8) {
     GetGlobal,
     SetLocal,
     GetLocal,
+    JumpIfFalse,
+    Jump,
+    /// A backwards jump, used for loops.
+    Loop,
     _,
 };
 
@@ -166,6 +170,13 @@ const Chunk = struct {
         // }
 
         // try io.flush();
+    }
+
+    pub fn readShort(self: *const Chunk, offset: usize) usize {
+        var res: usize = 0;
+        res |= @as(usize, self.code[offset]) << 8;
+        res |= @as(usize, self.code[offset + 1]);
+        return res;
     }
 };
 
@@ -267,6 +278,22 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
             try io.writeAll("Pop\n");
             return offset + 1;
         },
+        .JumpIfFalse => {
+            const toSkip = chunk.readShort(offset + 1);
+            try io.print("{s} {d: <3} \n", .{ "JumpIfFalse   ", @as(isize, @intCast(toSkip + 2)) });
+            return offset + 3;
+        },
+        .Jump => {
+            const toSkip = chunk.readShort(offset + 1);
+            try io.print("{s} {d: <3} \n", .{ "Jump          ", @as(isize, @intCast(toSkip + 2)) });
+            return offset + 3;
+        },
+        .Loop => {
+            const toSkip = chunk.readShort(offset + 1);
+            try io.print("{s} {d: <3} \n", .{ "Loop          ", -@as(isize, @intCast(toSkip + 2)) });
+            return offset + 3;
+        },
+
         _ => {
             try io.print("Unknown opcode {d}\n", .{chunk.code[offset]});
             return offset + 1;
@@ -309,6 +336,37 @@ pub const ChunkWriter = struct {
 
     pub fn emitOp(self: *ChunkWriter, op: OpCode) !void {
         try self.emit(@as(u8, @intFromEnum(op)));
+    }
+
+    pub fn emitLoop(self: *ChunkWriter, offset: usize) !void {
+        try self.emitOp(.Loop);
+
+        // Account for the two bytes of the jump offset itself.
+        const loop = self.code.items.len - offset + 2;
+        if (loop > 0xFFFF) {
+            return error.JumpTooLong;
+        }
+
+        try self.emit(@intCast((loop >> 8) & 0xFF));
+        try self.emit(@intCast(loop & 0xFF));
+    }
+
+    pub fn emitJump(self: *ChunkWriter, op: OpCode) !usize {
+        try self.emitOp(op);
+        // Placeholders for the jump offset, which we'll patch later.
+        try self.emit(0xFF);
+        try self.emit(0xFF);
+        return self.code.items.len - 2;
+    }
+
+    pub fn patchJump(self: *ChunkWriter, offset: usize) !void {
+        const jump = self.code.items.len - offset - 2;
+        if (jump > 0xFFFF) {
+            return error.JumpTooLong;
+        }
+
+        self.code.items[offset] = @intCast((jump >> 8) & 0xFF);
+        self.code.items[offset + 1] = @intCast(jump & 0xFF);
     }
 
     pub fn emitOps(self: *ChunkWriter, op1: OpCode, op2: OpCode) !void {
@@ -365,7 +423,7 @@ pub fn interpretChunk(alloc: std.mem.Allocator, chunk: *const Chunk, io: *std.Io
     return vm.run();
 }
 
-const debugTraceExecution = true;
+const debugTraceExecution = false;
 
 pub const VM = struct {
     alloc: std.mem.Allocator,
@@ -544,6 +602,20 @@ pub const VM = struct {
                 },
                 .Print => try vm.io.print("{f}\n", .{vm.pop()}),
                 .Pop => _ = vm.pop(),
+                .JumpIfFalse => {
+                    const toSkip = vm.offset();
+                    if (vm.peek(0).isFalsey()) {
+                        vm.ip += toSkip;
+                    }
+                },
+                .Jump => {
+                    const toSkip = vm.offset();
+                    vm.ip += toSkip;
+                },
+                .Loop => {
+                    const toSkip = vm.offset();
+                    vm.ip -= toSkip;
+                },
             }
         }
 
@@ -606,6 +678,12 @@ pub const VM = struct {
         const val = vm.chunk.code[vm.ip];
         vm.ip += 1;
         return val;
+    }
+
+    fn offset(vm: *VM) usize {
+        const addr = vm.chunk.readShort(vm.ip);
+        vm.ip += 2;
+        return addr;
     }
 
     fn peek(vm: *VM, distance: usize) Value {
@@ -943,6 +1021,7 @@ const ParseError = error{
     OutOfMemory,
     TooManyLocals,
     InvalidCharacter,
+    JumpTooLong,
 };
 
 const Parser = struct {
@@ -1029,6 +1108,24 @@ const Parser = struct {
         const val = try std.fmt.parseFloat(f64, parser.previous.source);
         const index = try parser.writer.makeConstant(Value{ .float = val });
         try parser.writer.emitConstant(index);
+    }
+
+    // Logical and.
+    fn land(parser: *Parser, _: bool) !void {
+        const endJump = try parser.writer.emitJump(.JumpIfFalse);
+        try parser.writer.emitOp(.Pop);
+        try parser.parsePrecedence(.And);
+        try parser.writer.patchJump(endJump);
+    }
+
+    // Logical or.
+    fn lor(parser: *Parser, _: bool) !void {
+        const elseJump = try parser.writer.emitJump(.JumpIfFalse);
+        const endJump = try parser.writer.emitJump(.Jump);
+        try parser.writer.patchJump(elseJump);
+        try parser.writer.emitOp(.Pop);
+        try parser.parsePrecedence(.Or);
+        try parser.writer.patchJump(endJump);
     }
 
     fn string(parser: *Parser, _: bool) !void {
@@ -1139,6 +1236,86 @@ const Parser = struct {
         try parser.writer.emitOp(.Print);
     }
 
+    fn ifStatement(parser: *Parser) ParseError!void {
+        parser.consume(.LeftParen, "Expect '(' after 'if'.");
+        try parser.expression();
+        parser.consume(.RightParen, "Expect ')' after condition.");
+
+        // Jump to the else branch if the condition is false.
+        const thenJump = try parser.writer.emitJump(.JumpIfFalse);
+        try parser.writer.emitOp(.Pop);
+        try parser.statement();
+
+        const elseJump = try parser.writer.emitJump(.Jump);
+        try parser.writer.emitOp(.Pop);
+
+        try parser.writer.patchJump(thenJump);
+
+        if (parser.match(.Else)) {
+            try parser.statement();
+        }
+        try parser.writer.patchJump(elseJump);
+    }
+
+    fn whileStatement(parser: *Parser) ParseError!void {
+        const loopStart = parser.writer.code.items.len;
+
+        parser.consume(.LeftParen, "Expect '(' after 'while'.");
+        try parser.expression();
+        parser.consume(.RightParen, "Expect ')' after condition.");
+
+        const exitJump = try parser.writer.emitJump(.JumpIfFalse);
+        try parser.writer.emitOp(.Pop);
+        try parser.statement();
+        try parser.writer.emitLoop(loopStart);
+        try parser.writer.patchJump(exitJump);
+        try parser.writer.emitOp(.Pop);
+    }
+
+    fn forStatement(parser: *Parser) ParseError!void {
+        parser.beginScope();
+        parser.consume(.LeftParen, "Expect '(' after 'for'.");
+
+        if (parser.match(.Semicolon)) {
+            // No initializer.
+        } else if (parser.match(.Var)) {
+            try parser.varDeclaration();
+        } else {
+            try parser.expressionStatement();
+        }
+
+        var loopStart = parser.writer.code.items.len;
+
+        var exitJump: usize = 0;
+        if (!parser.match(.Semicolon)) {
+            try parser.expression();
+            parser.consume(.Semicolon, "Expect ';' after loop condition.");
+            exitJump = try parser.writer.emitJump(.JumpIfFalse);
+            try parser.writer.emitOp(.Pop);
+        }
+
+        if (!parser.match(.RightParen)) {
+            const bodyJump = try parser.writer.emitJump(.Jump);
+            const incrementStart = parser.writer.code.items.len;
+            try parser.expression();
+            try parser.writer.emitOp(.Pop);
+            parser.consume(.RightParen, "Expect ')' after for clauses.");
+            try parser.writer.emitLoop(loopStart);
+            loopStart = incrementStart;
+            try parser.writer.patchJump(bodyJump);
+        }
+
+        try parser.statement();
+        try parser.writer.emitLoop(loopStart);
+
+        if (exitJump != 0) {
+            try parser.writer.patchJump(exitJump);
+            try parser.writer.emitOp(.Pop);
+        }
+
+        try parser.endScope();
+    }
+
     fn expressionStatement(parser: *Parser) !void {
         try parser.expression();
         parser.consume(.Semicolon, "Expect ';' after value.");
@@ -1171,6 +1348,12 @@ const Parser = struct {
             try parser.endScope();
         } else if (parser.match(.Print)) {
             try parser.printStatement();
+        } else if (parser.match(.If)) {
+            try parser.ifStatement();
+        } else if (parser.match(.For)) {
+            try parser.forStatement();
+        } else if (parser.match(.While)) {
+            try parser.whileStatement();
         } else {
             try parser.expressionStatement();
         }
@@ -1255,7 +1438,7 @@ const Parser = struct {
         try parser.writer.emit(index);
     }
 
-    const ParseFn = *const fn (parser: *Parser, canAssign: bool) error{ InvalidCharacter, OutOfMemory }!void;
+    const ParseFn = *const fn (parser: *Parser, canAssign: bool) ParseError!void;
 
     const Rule = struct {
         prec: Precedence = .None,
@@ -1267,6 +1450,8 @@ const Parser = struct {
         return switch (typ) {
             .LeftParen => Rule{ .prefix = grouping },
             .Number => Rule{ .prec = .Term, .prefix = number },
+            .And => Rule{ .prec = .And, .infix = land },
+            .Or => Rule{ .prec = .And, .infix = lor },
             .String => Rule{ .prefix = string },
             .Identifier => Rule{ .prefix = variable },
             .Plus => Rule{ .prec = .Term, .infix = binary },
@@ -1300,27 +1485,7 @@ pub fn compile(source: []const u8, writer: *ChunkWriter) !bool {
     return !parser.hadError;
 }
 
-// test "compile" {
-//     const alloc = std.testing.allocator;
-
-//     var writer = ChunkWriter.init(alloc);
-//     defer writer.deinit();
-
-//     try std.testing.expect(try compile(
-//         \\"st" == "s" + "t";
-//     , &writer));
-
-//     var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
-//     defer allocating_writer.deinit();
-
-//     var buffer: [128]u8 = undefined;
-//     const file = std.fs.File.stderr();
-//     var stderr = std.fs.File.writer(file, &buffer);
-
-//     try std.testing.expectEqual(.OK, interpretChunk(alloc, &writer.chunk(), &stderr.interface));
-// }
-
-fn run(name: []const u8, source: []const u8) !void {
+fn run(name: []const u8, source: []const u8, expected_output: []const u8) !void {
     const alloc = std.testing.allocator;
 
     var writer = ChunkWriter.init(alloc);
@@ -1335,10 +1500,16 @@ fn run(name: []const u8, source: []const u8) !void {
     const file = std.fs.File.stderr();
     var stderr = std.fs.File.writer(file, &buffer);
 
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    const output_writer = &output.writer;
+    defer output.deinit();
+
     const chunk = writer.chunk();
     try chunk.disassemble(name, &stderr.interface);
 
-    try std.testing.expectEqual(.OK, interpretChunk(alloc, &writer.chunk(), &stderr.interface));
+    try std.testing.expectEqual(.OK, interpretChunk(alloc, &writer.chunk(), output_writer));
+
+    try std.testing.expectEqualStrings(expected_output, output.written());
 }
 
 test "re-assign variable" {
@@ -1346,6 +1517,9 @@ test "re-assign variable" {
         \\var a = 1;
         \\a = 3;
         \\print a;
+    ,
+        \\3
+        \\
     );
 }
 
@@ -1354,6 +1528,9 @@ test "print variable" {
         \\var beverage = "cafe au lait";
         \\var breakfast = "beignets with " + beverage;
         \\print breakfast;
+    ,
+        \\beignets with cafe au lait
+        \\
     );
 }
 
@@ -1366,6 +1543,86 @@ test "print block" {
         \\  print a;
         \\}
         \\print a;
+    ,
+        \\3
+        \\1
+        \\
+    );
+}
+
+test "if statement" {
+    try run("if",
+        \\if (true) {
+        \\  print "less";
+        \\} else {
+        \\  print "greater";
+        \\}
+    ,
+        \\less
+        \\
+    );
+
+    try run("if",
+        \\if (false) {
+        \\  print "less";
+        \\} else {
+        \\  print "greater";
+        \\}
+    ,
+        \\greater
+        \\
+    );
+}
+
+test "logical expressions" {
+    try run("logical",
+        \\print nil or "yes";
+        \\print nil and "yes";
+        \\print "yes" and "no";
+    ,
+        \\yes
+        \\nil
+        \\no
+        \\
+    );
+}
+
+test "while loop" {
+    try run("while",
+        \\var i = 0;
+        \\while (i < 3) {
+        \\  print i;
+        \\  i = i + 1;
+        \\}
+    ,
+        \\0
+        \\1
+        \\2
+        \\
+    );
+}
+
+test "for loop" {
+    try run("for",
+        \\for (var i = 0; i < 3; i = i + 1) {
+        \\  print i;
+        \\}
+    ,
+        \\0
+        \\1
+        \\2
+        \\
+    );
+    try run("for",
+        \\for (var i = 0; i < 3;) {
+        \\  print i;
+        \\  i = i + 1;
+        \\}
+    ,
+        \\0
+        \\1
+        \\2
+        \\
     );
 }
 
