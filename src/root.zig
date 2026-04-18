@@ -63,7 +63,7 @@ const Value = union(ValueType) {
         return switch (self) {
             .obj => switch (self.obj.*) {
                 .string => true,
-                // else => false,
+                else => false,
             },
             else => false,
         };
@@ -73,7 +73,7 @@ const Value = union(ValueType) {
         return switch (self) {
             .obj => switch (self.obj.*) {
                 .string => |s| s,
-                // else => false,
+                else => null,
             },
             else => null,
         };
@@ -83,6 +83,10 @@ const Value = union(ValueType) {
 const String = struct {
     chars: []const u8,
     hash: u64,
+
+    fn deinit(self: String, alloc: std.mem.Allocator) void {
+        alloc.free(self.chars);
+    }
 };
 const StringHashing = struct {
     pub fn hash(self: @This(), s: String) u64 {
@@ -95,22 +99,57 @@ const StringHashing = struct {
     }
 };
 
+const FunctionType = enum {
+    Function,
+    Script,
+};
+
+const Function = struct {
+    name: ?String,
+    arity: u8,
+    chunk: Chunk,
+    typ: FunctionType,
+
+    fn disassemble(self: *const Function, io: *std.Io.Writer) !void {
+        if (self.name) |name| {
+            try io.print("== <fn {s}> ==\n", .{name.chars});
+        } else {
+            try io.writeAll("== <script> ==\n");
+        }
+        try self.chunk.disassemble(io);
+    }
+};
 
 const ObjectType = enum {
     string,
+    function,
 };
 const Object = union(ObjectType) {
     string: String,
+    function: Function,
 
     pub fn deinit(self: Object, alloc: std.mem.Allocator) void {
         switch (self) {
-            .string => |string| alloc.free(string.chars),
+            .string => |string| string.deinit(alloc),
+            .function => |function| {
+                if (function.name) |name| {
+                    name.deinit(alloc);
+                }
+                function.chunk.deinit(alloc);
+            },
         }
     }
 
     pub fn format(self: Object, writer: *std.Io.Writer) !void {
         try switch (self) {
             .string => |string| writer.writeAll(string.chars),
+            .function => |function| {
+                if (function.name) |name| {
+                    try writer.print("<fn {s}>", .{name.chars});
+                } else {
+                    try writer.writeAll("<script>");
+                }
+            },
         };
     }
 
@@ -149,12 +188,18 @@ const OpCode = enum(u8) {
 };
 
 const Chunk = struct {
-    code: []const u8,
-    constants: []const Value,
+    code: []u8 = undefined,
+    constants: []Value = undefined,
 
-    pub fn disassemble(chunk: *const Chunk, name: []const u8, io: *std.Io.Writer) !void {
-        try io.print("== {s} ==\n", .{name});
+    pub fn deinit(self: Chunk, alloc: std.mem.Allocator) void {
+        alloc.free(self.code);
+        for (self.constants) |constant| {
+            constant.deinit(alloc);
+        }
+        alloc.free(self.constants);
+    }
 
+    pub fn disassemble(chunk: *const Chunk, io: *std.Io.Writer) !void {
         var offset: usize = 0;
         while (offset < chunk.code.len) {
             offset = try disassembleInstruction(chunk, offset, io);
@@ -302,11 +347,13 @@ pub const ChunkWriter = struct {
     gpa: std.mem.Allocator,
     code: std.ArrayList(u8) = .empty,
     constants: std.ArrayList(Value) = .empty,
+    fnType: FunctionType,
 
     /// Deinitialize with `deinit` or use `toOwnedSlice`.
-    pub fn init(gpa: std.mem.Allocator) ChunkWriter {
+    pub fn init(gpa: std.mem.Allocator, fnType: FunctionType) ChunkWriter {
         return ChunkWriter{
             .gpa = gpa,
+            .fnType = fnType,
         };
     }
 
@@ -317,6 +364,15 @@ pub const ChunkWriter = struct {
             val.deinit(self.gpa);
         }
         self.constants.deinit(self.gpa);
+    }
+
+    fn func(self: *const ChunkWriter) Function {
+        return Function{
+            .name = null,
+            .arity = 0,
+            .chunk = self.chunk(),
+            .typ = self.fnType,
+        };
     }
 
     /// Valid for the lifetime of the ChunkWriter.
@@ -413,9 +469,10 @@ pub const ChunkWriter = struct {
     }
 };
 
-fn interpretChunk(alloc: std.mem.Allocator, chunk: *const Chunk, io: *std.Io.Writer) !VM.Result {
+fn interpretFunc(alloc: std.mem.Allocator, func: *const Function, io: *std.Io.Writer) !VM.Result {
     var stack: [64]Value = undefined;
-    var vm = VM{ .alloc = alloc, .io = io, .chunk = chunk, .ip = 0, .stack = &stack };
+    var vm: VM = .init(alloc, io, func, &stack);
+    try vm.pushObj(.{ .function = func.* });
     defer vm.deinit();
     return vm.run();
 }
@@ -426,11 +483,54 @@ fn StringMap(comptime V: type) type {
     return std.hash_map.HashMapUnmanaged(String, V, StringHashing, 80);
 }
 
+// A call frame represents a single function invocation. It keeps track of the
+// function being called, where we are in that function's bytecode, and where
+// the function's local variables are on the stack.
+// It does not own any of its data, that is all owned by the VM.
+const CallFrame = struct {
+    const Self = @This();
+
+    function: *const Function,
+    ip: usize,
+    slots: []Value,
+
+    fn runnable(frame: Self) bool {
+        return frame.ip < frame.function.chunk.code.len;
+    }
+
+    /// Returns the next opcode.
+    fn op(vm: *Self) OpCode {
+        return @as(OpCode, @enumFromInt(vm.byte()));
+    }
+
+    fn constant(vm: *Self) Value {
+        return vm.function.chunk.constants[vm.byte()];
+    }
+
+    fn slot(vm: *Self) *Value {
+        return &vm.slots[vm.byte()];
+    }
+
+    fn byte(vm: *Self) u8 {
+        const val = vm.function.chunk.code[vm.ip];
+        vm.ip += 1;
+        return val;
+    }
+
+    fn offset(vm: *Self) usize {
+        const addr = vm.function.chunk.readShort(vm.ip);
+        vm.ip += 2;
+        return addr;
+    }
+};
+
 pub const VM = struct {
     alloc: std.mem.Allocator,
     io: *std.Io.Writer,
-    chunk: *const Chunk,
-    ip: usize,
+
+    frames: [64]CallFrame = undefined,
+    frameCount: usize = 0,
+
     stack: []Value,
     stackTop: usize = 0,
 
@@ -447,6 +547,21 @@ pub const VM = struct {
     };
 
     const Result = enum { OK, CompileError, RuntimeError };
+
+    fn init(alloc: std.mem.Allocator, io: *std.Io.Writer, func: *const Function, stack: []Value) VM {
+        var vm = VM{
+            .alloc = alloc,
+            .io = io,
+            .stack = stack,
+        };
+        vm.frames[0] = CallFrame{
+            .function = func,
+            .ip = 0,
+            .slots = vm.stack[0..],
+        };
+        vm.frameCount = 1;
+        return vm;
+    }
 
     fn deinit(vm: *VM) void {
         var keys = vm.strings.keyIterator();
@@ -470,21 +585,22 @@ pub const VM = struct {
     }
 
     fn run(vm: *VM) !Result {
-        while (vm.ip < vm.chunk.code.len) {
+        var frame = &vm.frames[vm.frameCount - 1];
+
+        while (frame.runnable()) {
             if (comptime debugTraceExecution) {
                 try vm.io.writeAll("[ ");
                 for (vm.stack[0..vm.stackTop]) |val| {
                     try vm.io.print("{f} ", .{val});
                 }
                 try vm.io.writeAll("]\n");
-                _ = disassembleInstruction(vm.chunk, vm.ip, vm.io) catch {};
+                _ = disassembleInstruction(frame.function.chunk, frame.ip, vm.io) catch {};
                 try vm.io.flush();
             }
 
-            switch (vm.op()) {
+            switch (frame.op()) {
                 .Constant => {
-                    const index = vm.byte();
-                    const constant = vm.chunk.constants[index];
+                    const constant = frame.constant();
 
                     if (constant.asString()) |str| {
                         // If we've already interned the string, use that instance.
@@ -504,7 +620,7 @@ pub const VM = struct {
                     }
                 },
                 .DefineGlobal => {
-                    const constant = vm.chunk.constants[vm.byte()];
+                    const constant = frame.constant();
                     if (constant.asString()) |str| {
                         try vm.globals.put(vm.alloc, str, vm.pop());
                     } else {
@@ -514,7 +630,7 @@ pub const VM = struct {
                     }
                 },
                 .SetGlobal => {
-                    const constant = vm.chunk.constants[vm.byte()];
+                    const constant = frame.constant();
                     if (constant.asString()) |str| {
                         if (vm.globals.getPtr(str)) |ptr| {
                             ptr.* = vm.peek(0);
@@ -530,7 +646,7 @@ pub const VM = struct {
                     }
                 },
                 .GetGlobal => {
-                    const constant = vm.chunk.constants[vm.byte()];
+                    const constant = frame.constant();
                     if (constant.asString()) |str| {
                         if (vm.globals.get(str)) |val| {
                             vm.push(val);
@@ -546,10 +662,12 @@ pub const VM = struct {
                     }
                 },
                 .SetLocal => {
-                    vm.stack[vm.byte()] = vm.peek(0);
+                    // vm.stack[vm.byte()] = vm.peek(0);
+                    frame.slot().* = vm.peek(0);
                 },
                 .GetLocal => {
-                    vm.push(vm.stack[vm.byte()]);
+                    // vm.push(vm.stack[vm.byte()]);
+                    vm.push(frame.slot().*);
                 },
                 .Nil => vm.push(.nil),
                 .True => vm.push(Value{ .bool = true }),
@@ -604,18 +722,18 @@ pub const VM = struct {
                 .Print => try vm.io.print("{f}\n", .{vm.pop()}),
                 .Pop => _ = vm.pop(),
                 .JumpIfFalse => {
-                    const toSkip = vm.offset();
+                    const toSkip = frame.offset();
                     if (vm.peek(0).isFalsey()) {
-                        vm.ip += toSkip;
+                        frame.ip += toSkip;
                     }
                 },
                 .Jump => {
-                    const toSkip = vm.offset();
-                    vm.ip += toSkip;
+                    const toSkip = frame.offset();
+                    frame.ip += toSkip;
                 },
                 .Loop => {
-                    const toSkip = vm.offset();
-                    vm.ip -= toSkip;
+                    const toSkip = frame.offset();
+                    frame.ip -= toSkip;
                 },
             }
         }
@@ -668,23 +786,6 @@ pub const VM = struct {
             vm.alloc.free(result);
         }
         try vm.pushObj(Object{ .string = entry.key_ptr.* });
-    }
-
-    /// Returns the next opcode.
-    fn op(vm: *VM) OpCode {
-        return @as(OpCode, @enumFromInt(vm.byte()));
-    }
-
-    fn byte(vm: *VM) u8 {
-        const val = vm.chunk.code[vm.ip];
-        vm.ip += 1;
-        return val;
-    }
-
-    fn offset(vm: *VM) usize {
-        const addr = vm.chunk.readShort(vm.ip);
-        vm.ip += 2;
-        return addr;
     }
 
     fn peek(vm: *VM, distance: usize) Value {
@@ -750,6 +851,7 @@ const TokenType = enum {
     Var,
     While,
 
+    Special, // Used internally for the parser.
     Error,
     Eof,
 };
@@ -957,8 +1059,16 @@ const Compiler = struct {
     const Self = @This();
 
     locals: [128]Local = undefined,
-    localCount: u8 = 0,
+    localCount: u8 = 1, // First slot is reserved for VM internal use.
     scopeDepth: i32 = 0,
+
+    fn init() Compiler {
+        var compiler = Compiler{};
+        // The VM uses the first slot of the locals array internally, so we need to reserve it with a dummy value.
+        const token = Token{ .type = .Special, .source = "", .line = 0 };
+        compiler.locals[0] = Local{ .name = token, .depth = 0 };
+        return compiler;
+    }
 
     fn pop(self: *Self) u8 {
         self.scopeDepth -= 1;
@@ -1028,7 +1138,7 @@ const ParseError = error{
 const Parser = struct {
     alloc: std.mem.Allocator,
     scanner: Scanner,
-    compiler: Compiler = .{},
+    compiler: Compiler = .init(),
     writer: ChunkWriter,
     current: Token = Token{
         .type = .Error,
@@ -1043,7 +1153,7 @@ const Parser = struct {
         return Parser{
             .alloc = alloc,
             .scanner = Scanner{ .source = source },
-            .writer = ChunkWriter.init(alloc),
+            .writer = ChunkWriter.init(alloc, .Script),
         };
     }
 
@@ -1486,7 +1596,9 @@ const Parser = struct {
         };
     }
 
-    fn compile(parser: *Parser) !Chunk {
+    /// Compiles the source code into a function.
+    /// The lifetime of the function is tied to the parser.
+    fn compile(parser: *Parser) !Function {
         parser.advance();
 
         while (!parser.match(.Eof)) {
@@ -1497,17 +1609,17 @@ const Parser = struct {
             return error.ParseError;
         }
 
-        return parser.writer.chunk();
+        return parser.writer.func();
     }
 };
 
-fn run(name: []const u8, source: []const u8, expected_output: []const u8) !void {
+fn run(source: []const u8, expected_output: []const u8) !void {
     const alloc = std.testing.allocator;
 
     var parser = Parser.init(alloc, source);
     defer parser.deinit();
 
-    var chunk = try parser.compile();
+    var func = try parser.compile();
 
     var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer allocating_writer.deinit();
@@ -1520,15 +1632,15 @@ fn run(name: []const u8, source: []const u8, expected_output: []const u8) !void 
     const output_writer = &output.writer;
     defer output.deinit();
 
-    try chunk.disassemble(name, &stderr.interface);
+    try func.disassemble(&stderr.interface);
 
-    try std.testing.expectEqual(.OK, interpretChunk(alloc, &chunk, output_writer));
+    try std.testing.expectEqual(.OK, interpretFunc(alloc, &func, output_writer));
 
     try std.testing.expectEqualStrings(expected_output, output.written());
 }
 
 test "re-assign variable" {
-    try run("reassign",
+    try run(
         \\var a = 1;
         \\a = 3;
         \\print a;
@@ -1539,7 +1651,7 @@ test "re-assign variable" {
 }
 
 test "print variable" {
-    try run("concat",
+    try run(
         \\var beverage = "cafe au lait";
         \\var breakfast = "beignets with " + beverage;
         \\print breakfast;
@@ -1550,7 +1662,7 @@ test "print variable" {
 }
 
 test "print block" {
-    try run("block",
+    try run(
         \\var a = 1;
         \\{
         \\  var a = 2;
@@ -1566,7 +1678,7 @@ test "print block" {
 }
 
 test "if statement" {
-    try run("if",
+    try run(
         \\if (true) {
         \\  print "less";
         \\} else {
@@ -1577,7 +1689,7 @@ test "if statement" {
         \\
     );
 
-    try run("if",
+    try run(
         \\if (false) {
         \\  print "less";
         \\} else {
@@ -1590,7 +1702,7 @@ test "if statement" {
 }
 
 test "logical expressions" {
-    try run("logical",
+    try run(
         \\print nil or "yes";
         \\print nil and "yes";
         \\print "yes" and "no";
@@ -1603,7 +1715,7 @@ test "logical expressions" {
 }
 
 test "while loop" {
-    try run("while",
+    try run(
         \\var i = 0;
         \\while (i < 3) {
         \\  print i;
@@ -1618,7 +1730,7 @@ test "while loop" {
 }
 
 test "for loop" {
-    try run("for",
+    try run(
         \\for (var i = 0; i < 3; i = i + 1) {
         \\  print i;
         \\}
@@ -1628,7 +1740,7 @@ test "for loop" {
         \\2
         \\
     );
-    try run("for",
+    try run(
         \\for (var i = 0; i < 3;) {
         \\  print i;
         \\  i = i + 1;
@@ -1647,7 +1759,7 @@ pub fn interpret(source: []const u8, writer: *std.Io.Writer) !void {
     var parser = Parser.init(alloc, source);
     defer parser.deinit();
 
-    var chunk = try parser.compile();
+    var func = try parser.compile();
 
-    _ = try interpretChunk(alloc, &chunk, writer);
+    _ = try interpretFunc(alloc, &func, writer);
 }
