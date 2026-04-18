@@ -95,9 +95,6 @@ const StringHashing = struct {
     }
 };
 
-fn StringMap(comptime V: type) type {
-    return std.hash_map.HashMapUnmanaged(String, V, StringHashing, 80);
-}
 
 const ObjectType = enum {
     string,
@@ -416,7 +413,7 @@ pub const ChunkWriter = struct {
     }
 };
 
-pub fn interpretChunk(alloc: std.mem.Allocator, chunk: *const Chunk, io: *std.Io.Writer) !VM.Result {
+fn interpretChunk(alloc: std.mem.Allocator, chunk: *const Chunk, io: *std.Io.Writer) !VM.Result {
     var stack: [64]Value = undefined;
     var vm = VM{ .alloc = alloc, .io = io, .chunk = chunk, .ip = 0, .stack = &stack };
     defer vm.deinit();
@@ -424,6 +421,10 @@ pub fn interpretChunk(alloc: std.mem.Allocator, chunk: *const Chunk, io: *std.Io
 }
 
 const debugTraceExecution = false;
+
+fn StringMap(comptime V: type) type {
+    return std.hash_map.HashMapUnmanaged(String, V, StringHashing, 80);
+}
 
 pub const VM = struct {
     alloc: std.mem.Allocator,
@@ -1025,9 +1026,10 @@ const ParseError = error{
 };
 
 const Parser = struct {
+    alloc: std.mem.Allocator,
     scanner: Scanner,
     compiler: Compiler = .{},
-    writer: *ChunkWriter,
+    writer: ChunkWriter,
     current: Token = Token{
         .type = .Error,
         .source = "No parse\n",
@@ -1036,6 +1038,18 @@ const Parser = struct {
     previous: Token = undefined,
     hadError: bool = false,
     panicMode: bool = false,
+
+    fn init(alloc: std.mem.Allocator, source: []const u8) Parser {
+        return Parser{
+            .alloc = alloc,
+            .scanner = Scanner{ .source = source },
+            .writer = ChunkWriter.init(alloc),
+        };
+    }
+
+    fn deinit(self: *Parser) void {
+        self.writer.deinit();
+    }
 
     const Precedence = enum {
         None,
@@ -1471,27 +1485,29 @@ const Parser = struct {
             else => Rule{},
         };
     }
-};
 
-pub fn compile(source: []const u8, writer: *ChunkWriter) !bool {
-    var parser = Parser{ .scanner = Scanner{ .source = source }, .writer = writer };
+    fn compile(parser: *Parser) !Chunk {
+        parser.advance();
 
-    parser.advance();
+        while (!parser.match(.Eof)) {
+            try parser.declaration();
+        }
 
-    while (!parser.match(.Eof)) {
-        try parser.declaration();
+        if (parser.hadError) {
+            return error.ParseError;
+        }
+
+        return parser.writer.chunk();
     }
-
-    return !parser.hadError;
-}
+};
 
 fn run(name: []const u8, source: []const u8, expected_output: []const u8) !void {
     const alloc = std.testing.allocator;
 
-    var writer = ChunkWriter.init(alloc);
-    defer writer.deinit();
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
 
-    try std.testing.expect(try compile(source, &writer));
+    var chunk = try parser.compile();
 
     var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer allocating_writer.deinit();
@@ -1504,10 +1520,9 @@ fn run(name: []const u8, source: []const u8, expected_output: []const u8) !void 
     const output_writer = &output.writer;
     defer output.deinit();
 
-    const chunk = writer.chunk();
     try chunk.disassemble(name, &stderr.interface);
 
-    try std.testing.expectEqual(.OK, interpretChunk(alloc, &writer.chunk(), output_writer));
+    try std.testing.expectEqual(.OK, interpretChunk(alloc, &chunk, output_writer));
 
     try std.testing.expectEqualStrings(expected_output, output.written());
 }
@@ -1629,10 +1644,10 @@ test "for loop" {
 pub fn interpret(source: []const u8, writer: *std.Io.Writer) !void {
     const alloc = std.heap.page_allocator;
 
-    var cWriter = ChunkWriter.init(alloc);
-    defer cWriter.deinit();
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
 
-    if (try compile(source, &cWriter)) {
-        _ = try interpretChunk(alloc, &cWriter.chunk(), writer);
-    }
+    var chunk = try parser.compile();
+
+    _ = try interpretChunk(alloc, &chunk, writer);
 }

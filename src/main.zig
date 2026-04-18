@@ -12,13 +12,14 @@ pub fn main() !void {
     // Skip binary name.
     _ = args.skip();
 
+    var outBuf: [1024]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&outBuf);
+
     if (args.next()) |file| {
-        try runFile(file);
+        try runFile(file, &out.interface);
     } else {
         var buffer: [1024]u8 = undefined;
-        var outBuf: [1024]u8 = undefined;
         var in = std.fs.File.stdin().reader(&buffer);
-        var out = std.fs.File.stdout().writer(&outBuf);
 
         while (true) {
             std.debug.print("> ", .{});
@@ -30,24 +31,16 @@ pub fn main() !void {
     }
 }
 
-fn runFile(name: []const u8) !void {
+fn runFile(name: []const u8, out: *std.Io.Writer) !void {
     const alloc = std.heap.page_allocator;
 
     const buf = try readFileToBuffer(alloc, name);
     defer alloc.free(buf);
 
-    var writer = zlox.ChunkWriter.init(alloc);
-    defer writer.deinit();
-
-    if (!try zlox.compile(buf, &writer)) {
-        std.debug.print("Compile error.", .{});
+    zlox.interpret(buf, out) catch |err| {
+        std.debug.print("Error: {}\n", .{err});
         std.process.exit(64);
-    }
-
-    var buffer: [128]u8 = undefined;
-    const file = std.fs.File.stdout();
-    var stdout = std.fs.File.writer(file, &buffer);
-    _ = try zlox.interpretChunk(alloc, &writer.chunk(), &stdout.interface);
+    };
 }
 
 fn readFileToBuffer(allocator: std.mem.Allocator, fname: []const u8) ![]u8 {
