@@ -1,6 +1,11 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
 
+const debug = .{
+    .PrintBytecode = true,
+    .TraceExecution = false,
+};
+
 const ValueType = enum {
     nil,
     bool,
@@ -84,6 +89,15 @@ const String = struct {
     chars: []const u8,
     hash: u64,
 
+    fn init(alloc: std.mem.Allocator, str: []const u8) !String {
+        const chars = try alloc.alloc(u8, str.len);
+        @memcpy(chars, str);
+        return String{
+            .chars = chars,
+            .hash = std.hash_map.hashString(str),
+        };
+    }
+
     fn deinit(self: String, alloc: std.mem.Allocator) void {
         alloc.free(self.chars);
     }
@@ -110,6 +124,13 @@ const Function = struct {
     chunk: Chunk,
     typ: FunctionType,
 
+    fn deinit(self: Function, alloc: std.mem.Allocator) void {
+        if (self.name) |name| {
+            name.deinit(alloc);
+        }
+        self.chunk.deinit(alloc);
+    }
+
     fn disassemble(self: *const Function, io: *std.Io.Writer) !void {
         if (self.name) |name| {
             try io.print("== <fn {s}> ==\n", .{name.chars});
@@ -131,12 +152,7 @@ const Object = union(ObjectType) {
     pub fn deinit(self: Object, alloc: std.mem.Allocator) void {
         switch (self) {
             .string => |string| string.deinit(alloc),
-            .function => |function| {
-                if (function.name) |name| {
-                    name.deinit(alloc);
-                }
-                function.chunk.deinit(alloc);
-            },
+            .function => |function| function.deinit(alloc),
         }
     }
 
@@ -366,20 +382,20 @@ pub const ChunkWriter = struct {
         self.constants.deinit(self.gpa);
     }
 
-    fn func(self: *const ChunkWriter) Function {
+    fn func(self: *ChunkWriter) !Function {
         return Function{
             .name = null,
             .arity = 0,
-            .chunk = self.chunk(),
+            .chunk = try self.chunk(),
             .typ = self.fnType,
         };
     }
 
-    /// Valid for the lifetime of the ChunkWriter.
-    pub fn chunk(self: *const ChunkWriter) Chunk {
+    /// Returns a chunk that owns its memory.
+    pub fn chunk(self: *ChunkWriter) !Chunk {
         return Chunk{
-            .code = self.code.items,
-            .constants = self.constants.items,
+            .code = try self.code.toOwnedSlice(self.gpa),
+            .constants = try self.constants.toOwnedSlice(self.gpa),
         };
     }
 
@@ -439,17 +455,8 @@ pub const ChunkWriter = struct {
 
         const obj = try self.gpa.create(Object);
         errdefer self.gpa.destroy(obj);
-        obj.* = Object{ .string = String{
-            .chars = try self.copyString(str),
-            .hash = std.hash_map.hashString(str),
-        } };
+        obj.* = Object{ .string = try String.init(self.gpa, str) };
         return try self.makeConstant(Value{ .obj = obj });
-    }
-
-    fn copyString(self: *ChunkWriter, str: []const u8) ![]const u8 {
-        const chars = try self.gpa.alloc(u8, str.len);
-        @memcpy(chars, str);
-        return chars;
     }
 
     pub fn emitString(self: *ChunkWriter, str: []const u8) !void {
@@ -476,8 +483,6 @@ fn interpretFunc(alloc: std.mem.Allocator, func: *const Function, io: *std.Io.Wr
     defer vm.deinit();
     return vm.run();
 }
-
-const debugTraceExecution = false;
 
 fn StringMap(comptime V: type) type {
     return std.hash_map.HashMapUnmanaged(String, V, StringHashing, 80);
@@ -546,7 +551,7 @@ pub const VM = struct {
         data: Object,
     };
 
-    const Result = enum { OK, CompileError, RuntimeError };
+    const Result = enum { OK, CompileError, RuntimeError, Trace };
 
     fn init(alloc: std.mem.Allocator, io: *std.Io.Writer, func: *const Function, stack: []Value) VM {
         var vm = VM{
@@ -588,14 +593,17 @@ pub const VM = struct {
         var frame = &vm.frames[vm.frameCount - 1];
 
         while (frame.runnable()) {
-            if (comptime debugTraceExecution) {
-                try vm.io.writeAll("[ ");
+            if (comptime debug.TraceExecution) {
+                var buf: [1024]u8 = undefined;
+                const io = std.debug.lockStderrWriter(&buf);
+                defer std.debug.unlockStderrWriter();
+                try io.writeAll("[ ");
                 for (vm.stack[0..vm.stackTop]) |val| {
-                    try vm.io.print("{f} ", .{val});
+                    try io.print("{f} ", .{val});
                 }
-                try vm.io.writeAll("]\n");
-                _ = disassembleInstruction(frame.function.chunk, frame.ip, vm.io) catch {};
-                try vm.io.flush();
+                try io.writeAll("]\n");
+                _ = disassembleInstruction(&frame.function.chunk, frame.ip, io) catch {};
+                try io.flush();
             }
 
             switch (frame.op()) {
@@ -626,7 +634,7 @@ pub const VM = struct {
                     } else {
                         try vm.io.print("Expected string, got {f}!\n", .{constant});
                         try vm.io.flush();
-                        return .RuntimeError;
+                        return .Trace;
                     }
                 },
                 .SetGlobal => {
@@ -1058,16 +1066,21 @@ const Local = struct {
 const Compiler = struct {
     const Self = @This();
 
+    writer: ChunkWriter,
     locals: [128]Local = undefined,
     localCount: u8 = 1, // First slot is reserved for VM internal use.
     scopeDepth: i32 = 0,
 
-    fn init() Compiler {
-        var compiler = Compiler{};
+    fn init(alloc: std.mem.Allocator, typ: FunctionType) Compiler {
+        var compiler = Compiler{ .writer = ChunkWriter.init(alloc, typ) };
         // The VM uses the first slot of the locals array internally, so we need to reserve it with a dummy value.
         const token = Token{ .type = .Special, .source = "", .line = 0 };
         compiler.locals[0] = Local{ .name = token, .depth = 0 };
         return compiler;
+    }
+
+    fn deinit(self: *Self) void {
+        self.writer.deinit();
     }
 
     fn pop(self: *Self) u8 {
@@ -1090,6 +1103,7 @@ const Compiler = struct {
     }
 
     fn markInitialized(self: *Self) void {
+        if (self.scopeDepth == 0) return;
         self.locals[self.localCount - 1].depth = self.scopeDepth;
     }
 
@@ -1133,13 +1147,14 @@ const ParseError = error{
     TooManyLocals,
     InvalidCharacter,
     JumpTooLong,
+    WriteFailed,
 };
 
 const Parser = struct {
     alloc: std.mem.Allocator,
     scanner: Scanner,
-    compiler: Compiler = .init(),
-    writer: ChunkWriter,
+    compiler: *Compiler,
+    writer: *ChunkWriter,
     current: Token = Token{
         .type = .Error,
         .source = "No parse\n",
@@ -1149,16 +1164,20 @@ const Parser = struct {
     hadError: bool = false,
     panicMode: bool = false,
 
-    fn init(alloc: std.mem.Allocator, source: []const u8) Parser {
+    fn init(alloc: std.mem.Allocator, source: []const u8) !Parser {
+        const compiler = try alloc.create(Compiler);
+        compiler.* = Compiler.init(alloc, .Script);
         return Parser{
             .alloc = alloc,
             .scanner = Scanner{ .source = source },
-            .writer = ChunkWriter.init(alloc, .Script),
+            .compiler = compiler,
+            .writer = &compiler.writer,
         };
     }
 
     fn deinit(self: *Parser) void {
-        self.writer.deinit();
+        self.compiler.deinit();
+        self.alloc.destroy(self.compiler);
     }
 
     const Precedence = enum {
@@ -1483,6 +1502,71 @@ const Parser = struct {
         }
     }
 
+    fn funDeclaration(parser: *Parser) !void {
+        const global = try parser.parseVariable("Expect function name.");
+        parser.compiler.markInitialized();
+        try parser.function(.Function);
+        try parser.defineVariable(global);
+    }
+
+    fn function(parser: *Parser, funTy: FunctionType) !void {
+        var compiler = Compiler.init(parser.alloc, funTy);
+        defer compiler.deinit();
+
+        const str = try String.init(parser.alloc, parser.previous.source);
+        errdefer str.deinit(parser.alloc);
+
+        // Restore the previous compiler and writer after we're done, since
+        // functions can be nested.
+        const lastCompiler = parser.compiler;
+        const lastWriter = parser.writer;
+        parser.compiler = &compiler;
+        parser.writer = &compiler.writer;
+
+        parser.beginScope();
+
+        parser.consume(.LeftParen, "Expect '(' after function name.");
+        if (!parser.check(.RightParen)) {
+            while (true) {
+                compiler.localCount += 1;
+                if (compiler.localCount == compiler.locals.len) {
+                    parser.errorAt(parser.current, "Can't have more than 128 parameters.");
+                }
+
+                const paramName = parser.current;
+                parser.consume(.Identifier, "Expect parameter name.");
+                try compiler.addLocal(paramName);
+
+                if (!parser.match(.Comma)) break;
+            }
+        }
+        parser.consume(.RightParen, "Expect ')' after parameters.");
+        parser.consume(.LeftBrace, "Expect '{' before function body.");
+        try parser.block();
+
+        try parser.writer.emitOp(.Return);
+
+        var func = try parser.writer.func();
+        errdefer func.deinit(parser.alloc);
+        func.name = str;
+
+        parser.compiler = lastCompiler;
+        parser.writer = lastWriter;
+
+        if (comptime debug.PrintBytecode) {
+            var buf: [1024]u8 = undefined;
+            const io = std.debug.lockStderrWriter(&buf);
+            defer std.debug.unlockStderrWriter();
+            try func.disassemble(io);
+        }
+
+        const obj = try parser.alloc.create(Object);
+        errdefer parser.alloc.destroy(obj);
+        obj.* = Object{ .function = func };
+        const index = try parser.writer.makeConstant(Value{ .obj = obj });
+        try parser.writer.emitConstant(index);
+    }
+
     fn varDeclaration(parser: *Parser) !void {
         const global = try parser.parseVariable("Expect variable name.");
 
@@ -1509,6 +1593,8 @@ const Parser = struct {
     fn declaration(parser: *Parser) ParseError!void {
         if (parser.match(.Var)) {
             try parser.varDeclaration();
+        } else if (parser.match(.Fun)) {
+            try parser.funDeclaration();
         } else {
             try parser.statement();
         }
@@ -1616,10 +1702,11 @@ const Parser = struct {
 fn run(source: []const u8, expected_output: []const u8) !void {
     const alloc = std.testing.allocator;
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
 
     var func = try parser.compile();
+    defer func.deinit(alloc);
 
     var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer allocating_writer.deinit();
@@ -1632,7 +1719,9 @@ fn run(source: []const u8, expected_output: []const u8) !void {
     const output_writer = &output.writer;
     defer output.deinit();
 
-    try func.disassemble(&stderr.interface);
+    if (comptime debug.PrintBytecode) {
+        try func.disassemble(&stderr.interface);
+    }
 
     try std.testing.expectEqual(.OK, interpretFunc(alloc, &func, output_writer));
 
@@ -1749,6 +1838,18 @@ test "for loop" {
         \\0
         \\1
         \\2
+        \\
+    );
+}
+
+test "function" {
+    try run(
+        \\fun noop(i, g, n, o, r, e, d) {
+        \\  print "no-op";
+        \\}
+        \\print noop;
+    ,
+        \\<fn noop>
         \\
     );
 }
