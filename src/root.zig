@@ -3,7 +3,7 @@ const std = @import("std");
 
 const debug = .{
     .PrintBytecode = true,
-    .TraceExecution = false,
+    .TraceExecution = true,
 };
 
 const ValueType = enum {
@@ -83,6 +83,16 @@ const Value = union(ValueType) {
             else => null,
         };
     }
+
+    fn asFunction(self: Value) ?*const Function {
+        return switch (self) {
+            .obj => switch (self.obj.*) {
+                .function => |*f| f,
+                else => null,
+            },
+            else => null,
+        };
+    }
 };
 
 const String = struct {
@@ -131,13 +141,25 @@ const Function = struct {
         self.chunk.deinit(alloc);
     }
 
-    fn disassemble(self: *const Function, io: *std.Io.Writer) !void {
+    pub fn format(self: Function, writer: *std.Io.Writer) !void {
         if (self.name) |name| {
-            try io.print("== <fn {s}> ==\n", .{name.chars});
+            try writer.print("<fn {s}/{d}>", .{ name.chars, self.arity });
         } else {
-            try io.writeAll("== <script> ==\n");
+            try writer.writeAll("<script>");
         }
+    }
+
+    fn disassemble(self: *const Function, io: *std.Io.Writer) !void {
+        try io.print("== {f} ==\n", .{self});
         try self.chunk.disassemble(io);
+    }
+
+    fn debugDisassemble(self: *const Function) !void {
+        var buf: [1024]u8 = undefined;
+        const io = std.debug.lockStderrWriter(&buf);
+        defer std.debug.unlockStderrWriter();
+        try self.disassemble(io);
+        try io.flush();
     }
 };
 
@@ -159,13 +181,7 @@ const Object = union(ObjectType) {
     pub fn format(self: Object, writer: *std.Io.Writer) !void {
         try switch (self) {
             .string => |string| writer.writeAll(string.chars),
-            .function => |function| {
-                if (function.name) |name| {
-                    try writer.print("<fn {s}>", .{name.chars});
-                } else {
-                    try writer.writeAll("<script>");
-                }
-            },
+            .function => |function| function.format(writer),
         };
     }
 
@@ -200,6 +216,7 @@ const OpCode = enum(u8) {
     Jump,
     /// A backwards jump, used for loops.
     Loop,
+    Call,
     _,
 };
 
@@ -239,6 +256,8 @@ const Chunk = struct {
 };
 
 fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer) !usize {
+    // try io.print("{*}\n", .{chunk.code.ptr});
+
     try io.print("{d:0>4} ", .{offset});
 
     return switch (@as(OpCode, @enumFromInt(chunk.code[offset]))) {
@@ -351,6 +370,11 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
             try io.print("{s} {d: <3} \n", .{ "Loop          ", -@as(isize, @intCast(toSkip + 2)) });
             return offset + 3;
         },
+        .Call => {
+            const argCount = chunk.code[offset + 1];
+            try io.print("{s} {d: >3}\n", .{ "Call        ", argCount });
+            return offset + 2;
+        },
 
         _ => {
             try io.print("Unknown opcode {d}\n", .{chunk.code[offset]});
@@ -393,8 +417,10 @@ pub const ChunkWriter = struct {
 
     /// Returns a chunk that owns its memory.
     pub fn chunk(self: *ChunkWriter) !Chunk {
+        const code = try self.code.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(code);
         return Chunk{
-            .code = try self.code.toOwnedSlice(self.gpa),
+            .code = code,
             .constants = try self.constants.toOwnedSlice(self.gpa),
         };
     }
@@ -478,8 +504,7 @@ pub const ChunkWriter = struct {
 
 fn interpretFunc(alloc: std.mem.Allocator, func: *const Function, io: *std.Io.Writer) !VM.Result {
     var stack: [64]Value = undefined;
-    var vm: VM = .init(alloc, io, func, &stack);
-    try vm.pushObj(.{ .function = func.* });
+    var vm = try VM.init(alloc, io, func, &stack);
     defer vm.deinit();
     return vm.run();
 }
@@ -551,20 +576,16 @@ pub const VM = struct {
         data: Object,
     };
 
-    const Result = enum { OK, CompileError, RuntimeError, Trace };
+    const Result = enum { OK, CompileError, RuntimeError };
 
-    fn init(alloc: std.mem.Allocator, io: *std.Io.Writer, func: *const Function, stack: []Value) VM {
+    fn init(alloc: std.mem.Allocator, io: *std.Io.Writer, func: *const Function, stack: []Value) !VM {
         var vm = VM{
             .alloc = alloc,
             .io = io,
             .stack = stack,
         };
-        vm.frames[0] = CallFrame{
-            .function = func,
-            .ip = 0,
-            .slots = vm.stack[0..],
-        };
-        vm.frameCount = 1;
+        try vm.pushObj(.{ .function = func.* });
+        _ = try vm.call(func, 0);
         return vm;
     }
 
@@ -590,6 +611,20 @@ pub const VM = struct {
     }
 
     fn run(vm: *VM) !Result {
+        return vm.runLoop() catch |err| switch (err) {
+            error.RuntimeError => {
+                var i: isize = @intCast(vm.frameCount - 1);
+                while (i >= 0) : (i -= 1) {
+                    const frame = &vm.frames[@intCast(i)];
+                    try vm.io.print("[line ??] in {f}\n", .{frame.function});
+                }
+                return error.RuntimeError;
+            },
+            else => err,
+        };
+    }
+
+    fn runLoop(vm: *VM) !Result {
         var frame = &vm.frames[vm.frameCount - 1];
 
         while (frame.runnable()) {
@@ -624,6 +659,9 @@ pub const VM = struct {
                             try vm.pushObj(Object{ .string = string });
                         }
                     } else {
+                        if (constant.asFunction()) |func| {
+                            try func.debugDisassemble();
+                        }
                         vm.push(constant);
                     }
                 },
@@ -634,7 +672,7 @@ pub const VM = struct {
                     } else {
                         try vm.io.print("Expected string, got {f}!\n", .{constant});
                         try vm.io.flush();
-                        return .Trace;
+                        return .RuntimeError;
                     }
                 },
                 .SetGlobal => {
@@ -685,9 +723,16 @@ pub const VM = struct {
                     vm.push(Value{ .bool = val.isFalsey() });
                 },
                 .Return => {
-                    try vm.io.print("Return {f}\n", .{vm.pop()});
-                    try vm.io.flush();
-                    return .OK;
+                    const result = vm.pop();
+                    vm.frameCount -= 1;
+                    if (vm.frameCount == 0) {
+                        // Pop the script function off the stack.
+                        _ = vm.pop();
+                        return .OK;
+                    }
+                    vm.stackTop = frame.slots.ptr - vm.stack.ptr;
+                    vm.push(result);
+                    frame = &vm.frames[vm.frameCount - 1];
                 },
                 .Negate => {
                     const val = vm.pop();
@@ -743,11 +788,44 @@ pub const VM = struct {
                     const toSkip = frame.offset();
                     frame.ip -= toSkip;
                 },
+                .Call => {
+                    const argCount = frame.byte();
+                    if (vm.peek(argCount).asFunction()) |callee| {
+                        frame = try vm.call(callee, argCount);
+                    } else {
+                        try vm.io.print("Can only call functions and classes!\n", .{});
+                        try vm.io.flush();
+                        return .RuntimeError;
+                    }
+                },
             }
         }
 
+        // TODO: Require a return?
+
         try vm.io.flush();
         return .OK;
+    }
+
+    fn call(vm: *VM, callee: *const Function, argCount: usize) !*CallFrame {
+        if (argCount != callee.arity) {
+            try vm.io.print("Expected {d} arguments but got {d}!\n", .{ callee.arity, argCount });
+            try vm.io.flush();
+            return error.RuntimeError;
+        }
+        if (vm.frameCount == vm.frames.len) {
+            try vm.io.print("Stack overflow!\n", .{});
+            try vm.io.flush();
+            return error.RuntimeError;
+        }
+        vm.frames[vm.frameCount] = CallFrame{
+            .function = callee,
+            .ip = 0,
+            .slots = vm.stack[vm.stackTop - argCount - 1 ..],
+        };
+        const frame = &vm.frames[vm.frameCount];
+        vm.frameCount += 1;
+        return frame;
     }
 
     fn binop(vm: *VM, comptime code: OpCode) !void {
@@ -1063,11 +1141,13 @@ const Local = struct {
     depth: i32,
 };
 
+const MAX_LOCALS = 128;
+
 const Compiler = struct {
     const Self = @This();
 
     writer: ChunkWriter,
-    locals: [128]Local = undefined,
+    locals: [MAX_LOCALS]Local = undefined,
     localCount: u8 = 1, // First slot is reserved for VM internal use.
     scopeDepth: i32 = 0,
 
@@ -1093,7 +1173,7 @@ const Compiler = struct {
     }
 
     fn addLocal(self: *Self, name: Token) !void {
-        if (self.localCount == self.locals.len - 1) {
+        if (self.localCount == MAX_LOCALS - 1) {
             return error.TooManyLocals;
         }
         var local = &self.locals[self.localCount];
@@ -1148,6 +1228,7 @@ const ParseError = error{
     InvalidCharacter,
     JumpTooLong,
     WriteFailed,
+    TestExpectedEqual, // TODO: REMOVE!
 };
 
 const Parser = struct {
@@ -1245,6 +1326,29 @@ const Parser = struct {
         if (!parser.match(typ)) {
             parser.errorAt(parser.current, text);
         }
+    }
+
+    fn call(parser: *Parser, _: bool) !void {
+        const argCount = try parser.argumentList();
+        try parser.writer.emitOp(.Call);
+        try parser.writer.emit(argCount);
+    }
+
+    fn argumentList(parser: *Parser) !u8 {
+        var argCount: u8 = 0;
+        if (!parser.check(.RightParen)) {
+            while (true) {
+                try parser.expression();
+                if (argCount == MAX_LOCALS) {
+                    parser.errorAt(parser.current, "Can't have more than 128 arguments.");
+                }
+                argCount += 1;
+
+                if (!parser.match(.Comma)) break;
+            }
+        }
+        parser.consume(.RightParen, "Expect ')' after arguments.");
+        return argCount;
     }
 
     fn number(parser: *Parser, _: bool) !void {
@@ -1379,6 +1483,20 @@ const Parser = struct {
         try parser.writer.emitOp(.Print);
     }
 
+    fn returnStatement(parser: *Parser) !void {
+        if (parser.compiler.writer.fnType == .Script) {
+            parser.errorAt(parser.previous, "Can't return from top-level code.");
+        }
+
+        if (parser.check(.Semicolon)) {
+            try parser.emitReturn();
+        } else {
+            try parser.expression();
+            parser.consume(.Semicolon, "Expect ';' after return value.");
+            try parser.writer.emitOp(.Return);
+        }
+    }
+
     fn ifStatement(parser: *Parser) ParseError!void {
         parser.consume(.LeftParen, "Expect '(' after 'if'.");
         try parser.expression();
@@ -1495,6 +1613,8 @@ const Parser = struct {
             try parser.ifStatement();
         } else if (parser.match(.For)) {
             try parser.forStatement();
+        } else if (parser.match(.Return)) {
+            try parser.returnStatement();
         } else if (parser.match(.While)) {
             try parser.whileStatement();
         } else {
@@ -1513,8 +1633,7 @@ const Parser = struct {
         var compiler = Compiler.init(parser.alloc, funTy);
         defer compiler.deinit();
 
-        const str = try String.init(parser.alloc, parser.previous.source);
-        errdefer str.deinit(parser.alloc);
+        const nameBytes = parser.previous.source;
 
         // Restore the previous compiler and writer after we're done, since
         // functions can be nested.
@@ -1525,17 +1644,17 @@ const Parser = struct {
 
         parser.beginScope();
 
+        var arity: u8 = 0;
         parser.consume(.LeftParen, "Expect '(' after function name.");
         if (!parser.check(.RightParen)) {
             while (true) {
-                compiler.localCount += 1;
-                if (compiler.localCount == compiler.locals.len) {
+                arity += 1;
+                if (arity == MAX_LOCALS) {
                     parser.errorAt(parser.current, "Can't have more than 128 parameters.");
                 }
 
-                const paramName = parser.current;
-                parser.consume(.Identifier, "Expect parameter name.");
-                try compiler.addLocal(paramName);
+                const id = try parser.parseVariable("Expect parameter name.");
+                try parser.defineVariable(id);
 
                 if (!parser.match(.Comma)) break;
             }
@@ -1544,20 +1663,19 @@ const Parser = struct {
         parser.consume(.LeftBrace, "Expect '{' before function body.");
         try parser.block();
 
-        try parser.writer.emitOp(.Return);
+        try parser.emitReturn();
 
         var func = try parser.writer.func();
+        func.arity = arity;
         errdefer func.deinit(parser.alloc);
-        func.name = str;
+
+        func.name = try String.init(parser.alloc, nameBytes);
 
         parser.compiler = lastCompiler;
         parser.writer = lastWriter;
 
         if (comptime debug.PrintBytecode) {
-            var buf: [1024]u8 = undefined;
-            const io = std.debug.lockStderrWriter(&buf);
-            defer std.debug.unlockStderrWriter();
-            try func.disassemble(io);
+            try func.debugDisassemble();
         }
 
         const obj = try parser.alloc.create(Object);
@@ -1565,6 +1683,11 @@ const Parser = struct {
         obj.* = Object{ .function = func };
         const index = try parser.writer.makeConstant(Value{ .obj = obj });
         try parser.writer.emitConstant(index);
+    }
+
+    fn emitReturn(parser: *Parser) !void {
+        try parser.writer.emitOp(.Nil);
+        try parser.writer.emitOp(.Return);
     }
 
     fn varDeclaration(parser: *Parser) !void {
@@ -1658,7 +1781,7 @@ const Parser = struct {
 
     fn getRule(typ: TokenType) Rule {
         return switch (typ) {
-            .LeftParen => Rule{ .prefix = grouping },
+            .LeftParen => Rule{ .prec = .Call, .prefix = grouping, .infix = call },
             .Number => Rule{ .prec = .Term, .prefix = number },
             .And => Rule{ .prec = .And, .infix = land },
             .Or => Rule{ .prec = .And, .infix = lor },
@@ -1700,6 +1823,10 @@ const Parser = struct {
 };
 
 fn run(source: []const u8, expected_output: []const u8) !void {
+    try runRes(source, expected_output, .OK);
+}
+
+fn runRes(source: []const u8, expected_output: []const u8, res: VM.Result) !void {
     const alloc = std.testing.allocator;
 
     var parser = try Parser.init(alloc, source);
@@ -1723,7 +1850,7 @@ fn run(source: []const u8, expected_output: []const u8) !void {
         try func.disassemble(&stderr.interface);
     }
 
-    try std.testing.expectEqual(.OK, interpretFunc(alloc, &func, output_writer));
+    try std.testing.expectEqual(res, interpretFunc(alloc, &func, output_writer));
 
     try std.testing.expectEqualStrings(expected_output, output.written());
 }
@@ -1849,10 +1976,43 @@ test "function" {
         \\}
         \\print noop;
     ,
-        \\<fn noop>
+        \\<fn noop/7>
         \\
     );
 }
+
+test "function call" {
+    try run(
+        \\fun add(a, b) {
+        \\  return a + b;
+        \\}
+        \\print add(1, 2);
+    ,
+        \\3
+        \\
+    );
+}
+
+// test "closure" {
+//     try run(
+//         \\fun makeCounter() {
+//         \\  var i = 0;
+//         \\  fun count() {
+//         \\    i = i + 1;
+//         \\    print i;
+//         \\  }
+//         \\  return count;
+//         \\}
+//         \\
+//         \\var counter = makeCounter();
+//         \\counter();
+//         \\counter();
+//     ,
+//         \\1
+//         \\2
+//         \\
+//     );
+// }
 
 pub fn interpret(source: []const u8, writer: *std.Io.Writer) !void {
     const alloc = std.heap.page_allocator;
