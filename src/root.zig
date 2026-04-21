@@ -12,7 +12,7 @@ const ValueType = enum {
     float,
     obj,
 };
-const Value = union(ValueType) {
+pub const Value = union(ValueType) {
     nil,
     bool: bool,
     float: f64,
@@ -99,6 +99,8 @@ const String = struct {
     chars: []const u8,
     hash: u64,
 
+    // Creates a new string by copying the given one. The returned string owns
+    // its memory and must be freed with `deinit`.
     fn init(alloc: std.mem.Allocator, str: []const u8) !String {
         const chars = try alloc.alloc(u8, str.len);
         @memcpy(chars, str);
@@ -110,6 +112,15 @@ const String = struct {
 
     fn deinit(self: String, alloc: std.mem.Allocator) void {
         alloc.free(self.chars);
+    }
+
+    // Creates a new string that borrows the given one. The returned string
+    // does not own its memory and must not be freed.
+    fn unowned(str: []const u8) String {
+        return String{
+            .chars = str,
+            .hash = std.hash_map.hashString(str),
+        };
     }
 };
 const StringHashing = struct {
@@ -522,13 +533,6 @@ pub const ChunkWriter = struct {
     }
 };
 
-fn interpretFunc(alloc: std.mem.Allocator, func: *const Function, io: *std.Io.Writer) !VM.Result {
-    var stack: [64]Value = undefined;
-    var vm = try VM.init(alloc, io, func, &stack);
-    defer vm.deinit();
-    return vm.run();
-}
-
 fn StringMap(comptime V: type) type {
     return std.hash_map.HashMapUnmanaged(String, V, StringHashing, 80);
 }
@@ -602,21 +606,15 @@ pub const VM = struct {
 
     const Result = enum { OK, CompileError, RuntimeError };
 
-    fn init(alloc: std.mem.Allocator, io: *std.Io.Writer, func: *const Function, stack: []Value) !VM {
-        var vm = VM{
+    pub fn init(alloc: std.mem.Allocator, io: *std.Io.Writer, stack: []Value) VM {
+        return VM{
             .alloc = alloc,
             .io = io,
             .stack = stack,
         };
-
-        try vm.defineNative("clock", clockNative);
-
-        try vm.pushObj(.{ .function = func.* });
-        _ = try vm.call(func, 0);
-        return vm;
     }
 
-    fn deinit(vm: *VM) void {
+    pub fn deinit(vm: *VM) void {
         var keys = vm.strings.keyIterator();
         while (keys.next()) |key| {
             vm.alloc.free(key.chars);
@@ -628,6 +626,20 @@ pub const VM = struct {
             vm.objects = n.next;
             vm.alloc.destroy(n);
         }
+    }
+
+    pub fn interpret(vm: *VM, source: []const u8) !Result {
+        var parser = try Parser.init(vm.alloc, source);
+        defer parser.deinit();
+
+        var func = try parser.compile();
+        defer func.deinit(vm.alloc);
+
+        if (comptime debug.PrintBytecode) {
+            try func.debugDisassemble();
+        }
+
+        return vm.run(&func);
     }
 
     fn obj(vm: *VM, data: Object) !*Object {
@@ -644,18 +656,20 @@ pub const VM = struct {
         //   tableSet(&vm.globals, AS_STRING(vm.stack[0]), vm.stack[1]);
         //   pop();
         //   pop()
+        const string = String.unowned(name);
 
-        const str = try String.init(vm.alloc, name);
-        errdefer str.deinit(vm.alloc);
         // Storing the string in the interning table ensures it is freed.
-        try vm.strings.put(vm.alloc, str, undefined);
+        const str = try vm.intern(string);
 
         const nativeObj = try vm.obj(Object{ .native = .{ .function = function } });
 
         try vm.globals.put(vm.alloc, str, Value{ .obj = nativeObj });
     }
 
-    fn run(vm: *VM) !Result {
+    fn run(vm: *VM, func: *const Function) !Result {
+        try vm.pushObj(.{ .function = func.* });
+        _ = try vm.call(func, 0);
+
         return vm.runLoop() catch |err| switch (err) {
             error.RuntimeError => {
                 var i: isize = @intCast(vm.frameCount - 1);
@@ -691,29 +705,18 @@ pub const VM = struct {
                     const constant = frame.constant();
 
                     if (constant.asString()) |str| {
-                        // If we've already interned the string, use that instance.
-                        if (vm.strings.getKey(str)) |string| {
-                            try vm.pushObj(Object{ .string = string });
-                        } else {
-                            // Otherwise, allocate a new one.
-                            const chars = try vm.alloc.alloc(u8, str.chars.len);
-                            errdefer vm.alloc.free(chars);
-                            @memcpy(chars, str.chars);
-                            const string = String{ .chars = chars, .hash = str.hash };
-                            try vm.strings.put(vm.alloc, string, undefined);
-                            try vm.pushObj(Object{ .string = string });
-                        }
+                        const interned = try vm.intern(str);
+                        try vm.pushObj(Object{ .string = interned });
                     } else {
-                        if (constant.asFunction()) |func| {
-                            try func.debugDisassemble();
-                        }
                         vm.push(constant);
                     }
                 },
                 .DefineGlobal => {
                     const constant = frame.constant();
                     if (constant.asString()) |str| {
-                        try vm.globals.put(vm.alloc, str, vm.pop());
+                        const interned = try vm.intern(str);
+                        try vm.globals.put(vm.alloc, interned, vm.peek(0));
+                        _ = vm.pop();
                     } else {
                         try vm.io.print("Expected string, got {f}!\n", .{constant});
                         try vm.io.flush();
@@ -773,6 +776,7 @@ pub const VM = struct {
                     if (vm.frameCount == 0) {
                         // Pop the script function off the stack.
                         _ = vm.pop();
+                        try vm.io.flush();
                         return .OK;
                     }
                     vm.stackTop = frame.slots.ptr - vm.stack.ptr;
@@ -862,10 +866,24 @@ pub const VM = struct {
             }
         }
 
-        // TODO: Require a return?
-
+        try vm.io.print("Missing a return to terminate the chunk!\n", .{});
         try vm.io.flush();
-        return .OK;
+        return .RuntimeError;
+    }
+
+    // Interns a string and returns the interned version. The returned string
+    // is owned by the VM and will be freed when the VM is deinitialized.
+    fn intern(vm: *VM, str: String) !String {
+        // If we've already interned the string, use that instance.
+        if (vm.strings.getKey(str)) |string| {
+            return string;
+        }
+
+        // Otherwise, allocate a new one.
+        var string = try String.init(vm.alloc, str.chars);
+        errdefer string.deinit(vm.alloc);
+        try vm.strings.put(vm.alloc, string, undefined);
+        return string;
     }
 
     fn call(vm: *VM, callee: *const Function, argCount: usize) !*CallFrame {
@@ -1879,39 +1897,24 @@ const Parser = struct {
             return error.ParseError;
         }
 
+        try parser.emitReturn();
+
         return parser.writer.func();
     }
 };
 
 fn run(source: []const u8, expected_output: []const u8) !void {
-    try runRes(source, expected_output, .OK);
-}
-
-fn runRes(source: []const u8, expected_output: []const u8, res: VM.Result) !void {
     const alloc = std.testing.allocator;
-
-    var parser = try Parser.init(alloc, source);
-    defer parser.deinit();
-
-    var func = try parser.compile();
-    defer func.deinit(alloc);
-
-    var allocating_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    var buffer: [128]u8 = undefined;
-    const file = std.fs.File.stderr();
-    var stderr = std.fs.File.writer(file, &buffer);
 
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     const output_writer = &output.writer;
     defer output.deinit();
 
-    if (comptime debug.PrintBytecode) {
-        try func.disassemble(&stderr.interface);
-    }
+    var stack: [128]Value = undefined;
+    var vm = VM.init(alloc, output_writer, &stack);
+    defer vm.deinit();
 
-    try std.testing.expectEqual(res, interpretFunc(alloc, &func, output_writer));
+    try std.testing.expectEqual(.OK, vm.interpret(source));
 
     try std.testing.expectEqualStrings(expected_output, output.written());
 }
@@ -1938,7 +1941,7 @@ test "print variable" {
     );
 }
 
-test "print block" {
+test "variable scope" {
     try run(
         \\var a = 1;
         \\{
@@ -2054,6 +2057,61 @@ test "function call" {
     );
 }
 
+test "interpret twice" {
+    const alloc = std.testing.allocator;
+
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    const output_writer = &output.writer;
+    defer output.deinit();
+
+    var stack: [128]Value = undefined;
+    var vm = VM.init(alloc, output_writer, &stack);
+    defer vm.deinit();
+
+    try std.testing.expectEqual(.OK, vm.interpret(
+        \\var a = 1;
+    ));
+
+    try std.testing.expectEqual(.OK, vm.interpret(
+        \\print a;
+    ));
+
+    try std.testing.expectEqualStrings(
+        \\1
+        \\
+    , output.written());
+}
+
+fn frameDepth(vm: *VM, _: []Value) NativeErr!Value {
+    return Value{ .float = @floatFromInt(vm.frameCount) };
+}
+
+test "native" {
+    const alloc = std.testing.allocator;
+
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    const output_writer = &output.writer;
+    defer output.deinit();
+
+    var stack: [128]Value = undefined;
+    var vm = VM.init(alloc, output_writer, &stack);
+    defer vm.deinit();
+
+    try vm.defineNative("frameDepth", frameDepth);
+
+    try std.testing.expectEqual(.OK, vm.interpret(
+        \\fun wrapper() {
+        \\  print frameDepth();
+        \\}
+        \\wrapper();
+    ));
+
+    try std.testing.expectEqualStrings(
+        \\2
+        \\
+    , output.written());
+}
+
 // test "closure" {
 //     try run(
 //         \\fun makeCounter() {
@@ -2074,14 +2132,3 @@ test "function call" {
 //         \\
 //     );
 // }
-
-pub fn interpret(source: []const u8, writer: *std.Io.Writer) !void {
-    const alloc = std.heap.page_allocator;
-
-    var parser = try Parser.init(alloc, source);
-    defer parser.deinit();
-
-    var func = try parser.compile();
-
-    _ = try interpretFunc(alloc, &func, writer);
-}

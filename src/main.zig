@@ -15,8 +15,18 @@ pub fn main() !void {
     var outBuf: [1024]u8 = undefined;
     var out = std.fs.File.stdout().writer(&outBuf);
 
+    var stack: [128]zlox.Value = undefined;
+    var vm = zlox.VM.init(std.heap.page_allocator, &out.interface, &stack);
+    defer vm.deinit();
+
     if (args.next()) |file| {
-        try runFile(file, &out.interface);
+        const buf = try readFileToBuffer(std.heap.page_allocator, file);
+        defer std.heap.page_allocator.free(buf);
+
+        _ = vm.interpret(buf) catch |err| {
+            std.debug.print("Error: {}\n", .{err});
+            std.process.exit(64);
+        };
     } else {
         var buffer: [1024]u8 = undefined;
         var in = std.fs.File.stdin().reader(&buffer);
@@ -26,21 +36,9 @@ pub fn main() !void {
             const res = try in.interface.takeSentinel('\n');
             std.debug.print("\n", .{});
 
-            try zlox.interpret(res, &out.interface);
+            _ = try vm.interpret(res);
         }
     }
-}
-
-fn runFile(name: []const u8, out: *std.Io.Writer) !void {
-    const alloc = std.heap.page_allocator;
-
-    const buf = try readFileToBuffer(alloc, name);
-    defer alloc.free(buf);
-
-    zlox.interpret(buf, out) catch |err| {
-        std.debug.print("Error: {}\n", .{err});
-        std.process.exit(64);
-    };
 }
 
 fn readFileToBuffer(allocator: std.mem.Allocator, fname: []const u8) ![]u8 {
