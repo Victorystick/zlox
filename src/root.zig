@@ -163,18 +163,37 @@ const Function = struct {
     }
 };
 
+const NativeErr = error{
+    OutOfMemory,
+    RuntimeError,
+    WriteFailed,
+};
+
+const NativeFn = *const fn (*VM, []Value) NativeErr!Value;
+
+const Native = struct {
+    function: NativeFn,
+
+    pub fn format(_: Native, writer: *std.Io.Writer) !void {
+        try writer.writeAll("<native fn>");
+    }
+};
+
 const ObjectType = enum {
     string,
     function,
+    native,
 };
 const Object = union(ObjectType) {
     string: String,
     function: Function,
+    native: Native,
 
     pub fn deinit(self: Object, alloc: std.mem.Allocator) void {
         switch (self) {
             .string => |string| string.deinit(alloc),
             .function => |function| function.deinit(alloc),
+            .native => {},
         }
     }
 
@@ -182,6 +201,7 @@ const Object = union(ObjectType) {
         try switch (self) {
             .string => |string| writer.writeAll(string.chars),
             .function => |function| function.format(writer),
+            .native => |native| native.format(writer),
         };
     }
 
@@ -554,6 +574,10 @@ const CallFrame = struct {
     }
 };
 
+fn clockNative(_: *VM, _: []Value) NativeErr!Value {
+    return Value{ .float = @as(f64, @floatFromInt(std.time.milliTimestamp())) / 1000.0 };
+}
+
 pub const VM = struct {
     alloc: std.mem.Allocator,
     io: *std.Io.Writer,
@@ -584,6 +608,9 @@ pub const VM = struct {
             .io = io,
             .stack = stack,
         };
+
+        try vm.defineNative("clock", clockNative);
+
         try vm.pushObj(.{ .function = func.* });
         _ = try vm.call(func, 0);
         return vm;
@@ -608,6 +635,24 @@ pub const VM = struct {
         node.* = ObjectNode{ .next = vm.objects, .data = data };
         vm.objects = node;
         return &node.data;
+    }
+
+    fn defineNative(vm: *VM, name: []const u8, function: NativeFn) !void {
+        // TODO: Verify avoiding push/pop doesn't break GC. Originally:
+        //   push(OBJ_VAL(copyString(name, (int)strlen(name))));
+        //   push(OBJ_VAL(newNative(function)));
+        //   tableSet(&vm.globals, AS_STRING(vm.stack[0]), vm.stack[1]);
+        //   pop();
+        //   pop()
+
+        const str = try String.init(vm.alloc, name);
+        errdefer str.deinit(vm.alloc);
+        // Storing the string in the interning table ensures it is freed.
+        try vm.strings.put(vm.alloc, str, undefined);
+
+        const nativeObj = try vm.obj(Object{ .native = .{ .function = function } });
+
+        try vm.globals.put(vm.alloc, str, Value{ .obj = nativeObj });
     }
 
     fn run(vm: *VM) !Result {
@@ -790,12 +835,28 @@ pub const VM = struct {
                 },
                 .Call => {
                     const argCount = frame.byte();
-                    if (vm.peek(argCount).asFunction()) |callee| {
-                        frame = try vm.call(callee, argCount);
-                    } else {
-                        try vm.io.print("Can only call functions and classes!\n", .{});
-                        try vm.io.flush();
-                        return .RuntimeError;
+                    switch (vm.peek(argCount)) {
+                        .obj => switch (vm.peek(argCount).obj.*) {
+                            .function => |*function| {
+                                frame = try vm.call(function, argCount);
+                            },
+                            .native => |native| {
+                                const args = vm.stack[vm.stackTop - argCount .. vm.stackTop];
+                                const result = try native.function(vm, args);
+                                vm.stackTop -= argCount + 1;
+                                vm.push(result);
+                            },
+                            else => {
+                                try vm.io.print("Can only call functions and classes!\n", .{});
+                                try vm.io.flush();
+                                return .RuntimeError;
+                            },
+                        },
+                        else => {
+                            try vm.io.print("Can only call functions and classes!\n", .{});
+                            try vm.io.flush();
+                            return .RuntimeError;
+                        },
                     }
                 },
             }
@@ -2017,7 +2078,7 @@ test "function call" {
 pub fn interpret(source: []const u8, writer: *std.Io.Writer) !void {
     const alloc = std.heap.page_allocator;
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
 
     var func = try parser.compile();
