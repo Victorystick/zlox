@@ -3,7 +3,7 @@ const std = @import("std");
 
 const debug = .{
     .PrintBytecode = true,
-    .TraceExecution = true,
+    .TraceExecution = false,
 };
 
 const ValueType = enum {
@@ -140,8 +140,9 @@ const FunctionType = enum {
 };
 
 const Function = struct {
-    name: ?String,
-    arity: u8,
+    name: ?String = null,
+    arity: u8 = 0,
+    upvalueCount: u8 = 0,
     chunk: Chunk,
     typ: FunctionType,
 
@@ -174,6 +175,36 @@ const Function = struct {
     }
 };
 
+const Upvalue = struct {
+    // Unowned.
+    location: *Value,
+    closed: Value = .nil,
+    // Unowned.
+    next: ?*Upvalue = null,
+};
+
+const Closure = struct {
+    // Unowned.
+    function: *const Function,
+    // Owned.
+    upvalues: []*Upvalue,
+
+    fn init(alloc: std.mem.Allocator, function: *const Function) error{OutOfMemory}!Closure {
+        return Closure{
+            .function = function,
+            .upvalues = try alloc.alloc(*Upvalue, function.upvalueCount),
+        };
+    }
+
+    fn deinit(self: Closure, alloc: std.mem.Allocator) void {
+        alloc.free(self.upvalues);
+    }
+
+    pub fn format(self: Closure, writer: *std.Io.Writer) !void {
+        return self.function.format(writer);
+    }
+};
+
 const NativeErr = error{
     OutOfMemory,
     RuntimeError,
@@ -194,16 +225,23 @@ const ObjectType = enum {
     string,
     function,
     native,
+    closure,
+    upvalue,
 };
 const Object = union(ObjectType) {
     string: String,
     function: Function,
     native: Native,
+    closure: Closure,
+    upvalue: Upvalue,
 
     pub fn deinit(self: Object, alloc: std.mem.Allocator) void {
         switch (self) {
+            // Handled elsewhere since strings are interned and may be shared between multiple objects.
             .string => |string| string.deinit(alloc),
             .function => |function| function.deinit(alloc),
+            .closure => |closure| closure.deinit(alloc),
+            .upvalue => {},
             .native => {},
         }
     }
@@ -213,6 +251,8 @@ const Object = union(ObjectType) {
             .string => |string| writer.writeAll(string.chars),
             .function => |function| function.format(writer),
             .native => |native| native.format(writer),
+            .closure => |closure| closure.format(writer),
+            .upvalue => writer.writeAll("<upvalue>"),
         };
     }
 
@@ -243,11 +283,15 @@ const OpCode = enum(u8) {
     GetGlobal,
     SetLocal,
     GetLocal,
+    SetUpvalue,
+    GetUpvalue,
+    CloseUpvalue,
     JumpIfFalse,
     Jump,
     /// A backwards jump, used for loops.
     Loop,
     Call,
+    Closure,
     _,
 };
 
@@ -287,8 +331,6 @@ const Chunk = struct {
 };
 
 fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer) !usize {
-    // try io.print("{*}\n", .{chunk.code.ptr});
-
     try io.print("{d:0>4} ", .{offset});
 
     return switch (@as(OpCode, @enumFromInt(chunk.code[offset]))) {
@@ -316,76 +358,26 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
             try io.print("{s} {d: >3} {f}\n", .{ "SetGlobal   ", index, constant });
             return offset + 2;
         },
-        .GetLocal => {
-            const index = chunk.code[offset + 1];
-            try io.print("{s} {d: >3}\n", .{ "GetLocal    ", index });
-            return offset + 2;
-        },
-        .SetLocal => {
-            const index = chunk.code[offset + 1];
-            try io.print("{s} {d: >3}\n", .{ "SetLocal    ", index });
-            return offset + 2;
-        },
-        .Return => {
-            try io.writeAll("Return\n");
-            return offset + 1;
-        },
-        .Negate => {
-            try io.writeAll("Negate\n");
-            return offset + 1;
-        },
-        .Add => {
-            try io.writeAll("Add\n");
-            return offset + 1;
-        },
-        .Subtract => {
-            try io.writeAll("Subtract\n");
-            return offset + 1;
-        },
-        .Multiply => {
-            try io.writeAll("Multiply\n");
-            return offset + 1;
-        },
-        .Divide => {
-            try io.writeAll("Divide\n");
-            return offset + 1;
-        },
-        .False => {
-            try io.writeAll("False\n");
-            return offset + 1;
-        },
-        .True => {
-            try io.writeAll("True\n");
-            return offset + 1;
-        },
-        .Nil => {
-            try io.writeAll("Nil\n");
-            return offset + 1;
-        },
-        .Not => {
-            try io.writeAll("Not\n");
-            return offset + 1;
-        },
-        .Equal => {
-            try io.writeAll("Equal\n");
-            return offset + 1;
-        },
-        .Greater => {
-            try io.writeAll("Greater\n");
-            return offset + 1;
-        },
-        .Less => {
-            try io.writeAll("Less\n");
-            return offset + 1;
-        },
-        .Print => {
-            try io.writeAll("Print\n");
-            return offset + 1;
-        },
-        .Pop => {
-            try io.writeAll("Pop\n");
-            return offset + 1;
-        },
+        .GetLocal => byteInstruction("GetLocal", chunk, offset, io),
+        .SetLocal => byteInstruction("SetLocal", chunk, offset, io),
+        .GetUpvalue => byteInstruction("GetUpvalue", chunk, offset, io),
+        .SetUpvalue => byteInstruction("SetUpvalue", chunk, offset, io),
+        .CloseUpvalue => simpleInstruction("CloseUpvalue", offset, io),
+        .Return => simpleInstruction("Return", offset, io),
+        .Negate => simpleInstruction("Negate", offset, io),
+        .Add => simpleInstruction("Add", offset, io),
+        .Subtract => simpleInstruction("Subtract", offset, io),
+        .Multiply => simpleInstruction("Multiply", offset, io),
+        .Divide => simpleInstruction("Divide", offset, io),
+        .False => simpleInstruction("False", offset, io),
+        .True => simpleInstruction("True", offset, io),
+        .Nil => simpleInstruction("Nil", offset, io),
+        .Not => simpleInstruction("Not", offset, io),
+        .Equal => simpleInstruction("Equal", offset, io),
+        .Greater => simpleInstruction("Greater", offset, io),
+        .Less => simpleInstruction("Less", offset, io),
+        .Print => simpleInstruction("Print", offset, io),
+        .Pop => simpleInstruction("Pop", offset, io),
         .JumpIfFalse => {
             const toSkip = chunk.readShort(offset + 1);
             try io.print("{s} {d: <3} \n", .{ "JumpIfFalse   ", @as(isize, @intCast(toSkip + 2)) });
@@ -401,12 +393,30 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
             try io.print("{s} {d: <3} \n", .{ "Loop          ", -@as(isize, @intCast(toSkip + 2)) });
             return offset + 3;
         },
-        .Call => {
-            const argCount = chunk.code[offset + 1];
-            try io.print("{s} {d: >3}\n", .{ "Call        ", argCount });
+        .Call => byteInstruction("Call", chunk, offset, io),
+        .Closure => {
+            // Read the following constant.
+            const constantIndex = chunk.code[offset + 1];
+            const constant = chunk.constants[constantIndex];
+            try io.print("{s: <12} {d: >3} {f}\n", .{ "Closure", constantIndex, constant });
+
+            if (constant.asFunction()) |function| {
+                // Read the upvalue count.
+                var upvalueOffset = offset + 2;
+                for (0..function.upvalueCount) |_| {
+                    const kind = if (chunk.code[upvalueOffset] == 1) "local" else "upvalue";
+                    const index = chunk.code[upvalueOffset + 1];
+                    try io.print("{d:0>4} |              {s: <8} {d: >3}\n", .{ upvalueOffset, kind, index });
+                    upvalueOffset += 2;
+                }
+
+                return upvalueOffset;
+            } else {
+                try io.writeAll("Closure with non-function constant!\n");
+            }
+
             return offset + 2;
         },
-
         _ => {
             try io.print("Unknown opcode {d}\n", .{chunk.code[offset]});
             return offset + 1;
@@ -414,10 +424,22 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
     };
 }
 
+fn simpleInstruction(name: []const u8, offset: usize, io: *std.Io.Writer) !usize {
+    try io.print("{s}\n", .{name});
+    return offset + 1;
+}
+
+fn byteInstruction(name: []const u8, chunk: *const Chunk, offset: usize, io: *std.Io.Writer) !usize {
+    const index = chunk.code[offset + 1];
+    try io.print("{s: <12} {d: >3}\n", .{ name, index });
+    return offset + 2;
+}
+
 pub const ChunkWriter = struct {
     gpa: std.mem.Allocator,
     code: std.ArrayList(u8) = .empty,
     constants: std.ArrayList(Value) = .empty,
+    upvalueCount: u8 = 0,
     fnType: FunctionType,
 
     /// Deinitialize with `deinit` or use `toOwnedSlice`.
@@ -439,10 +461,9 @@ pub const ChunkWriter = struct {
 
     fn func(self: *ChunkWriter) !Function {
         return Function{
-            .name = null,
-            .arity = 0,
             .chunk = try self.chunk(),
             .typ = self.fnType,
+            .upvalueCount = self.upvalueCount,
         };
     }
 
@@ -544,12 +565,12 @@ fn StringMap(comptime V: type) type {
 const CallFrame = struct {
     const Self = @This();
 
-    function: *const Function,
+    closure: *const Closure,
     ip: usize,
     slots: []Value,
 
     fn runnable(frame: Self) bool {
-        return frame.ip < frame.function.chunk.code.len;
+        return frame.ip < frame.closure.function.chunk.code.len;
     }
 
     /// Returns the next opcode.
@@ -558,7 +579,7 @@ const CallFrame = struct {
     }
 
     fn constant(vm: *Self) Value {
-        return vm.function.chunk.constants[vm.byte()];
+        return vm.closure.function.chunk.constants[vm.byte()];
     }
 
     fn slot(vm: *Self) *Value {
@@ -566,13 +587,13 @@ const CallFrame = struct {
     }
 
     fn byte(vm: *Self) u8 {
-        const val = vm.function.chunk.code[vm.ip];
+        const val = vm.closure.function.chunk.code[vm.ip];
         vm.ip += 1;
         return val;
     }
 
     fn offset(vm: *Self) usize {
-        const addr = vm.function.chunk.readShort(vm.ip);
+        const addr = vm.closure.function.chunk.readShort(vm.ip);
         vm.ip += 2;
         return addr;
     }
@@ -596,6 +617,9 @@ pub const VM = struct {
     strings: StringMap(*Object) = .empty,
     globals: StringMap(Value) = .empty,
 
+    // The head of a linked list of open upvalues.
+    openUpvalues: ?*Upvalue = null,
+
     // A linked list of all allocated objects.
     objects: ?*ObjectNode = null,
 
@@ -604,7 +628,7 @@ pub const VM = struct {
         data: Object,
     };
 
-    const Result = enum { OK, CompileError, RuntimeError };
+    const Result = enum { OK, RuntimeError };
 
     pub fn init(alloc: std.mem.Allocator, io: *std.Io.Writer, stack: []Value) VM {
         return VM{
@@ -630,10 +654,12 @@ pub const VM = struct {
         defer parser.deinit();
 
         const func = try parser.compile();
-        errdefer func.deinit(vm.alloc);
+        {
+            errdefer func.deinit(vm.alloc);
 
-        if (comptime debug.PrintBytecode) {
-            try func.debugDisassemble();
+            if (comptime debug.PrintBytecode) {
+                try func.debugDisassemble();
+            }
         }
 
         return vm.run(func);
@@ -663,16 +689,26 @@ pub const VM = struct {
         try vm.globals.put(vm.alloc, string, .{ .obj = nativeObj });
     }
 
+    // Takes ownership of the function.
     fn run(vm: *VM, func: Function) !Result {
         try vm.pushObj(.{ .function = func });
-        _ = try vm.call(&func, 0);
+
+        const o = try blk: {
+            const closure = try Closure.init(vm.alloc, &func);
+            errdefer closure.deinit(vm.alloc);
+            break :blk vm.createObject(.{ .closure = closure });
+        };
+        _ = vm.pop();
+        try vm.pushObj(.{ .closure = o.closure });
+
+        _ = try vm.call(&o.closure, 0);
 
         return vm.runLoop() catch |err| switch (err) {
             error.RuntimeError => {
                 var i: isize = @intCast(vm.frameCount - 1);
                 while (i >= 0) : (i -= 1) {
                     const frame = &vm.frames[@intCast(i)];
-                    try vm.io.print("[line ??] in {f}\n", .{frame.function});
+                    try vm.io.print("[line ??] in {f}\n", .{frame.closure.function});
                 }
                 return error.RuntimeError;
             },
@@ -693,7 +729,7 @@ pub const VM = struct {
                     try io.print("{f} ", .{val});
                 }
                 try io.writeAll("]\n");
-                _ = disassembleInstruction(&frame.function.chunk, frame.ip, io) catch {};
+                _ = disassembleInstruction(&frame.closure.function.chunk, frame.ip, io) catch {};
                 try io.flush();
             }
 
@@ -753,12 +789,22 @@ pub const VM = struct {
                     }
                 },
                 .SetLocal => {
-                    // vm.stack[vm.byte()] = vm.peek(0);
                     frame.slot().* = vm.peek(0);
                 },
                 .GetLocal => {
-                    // vm.push(vm.stack[vm.byte()]);
                     vm.push(frame.slot().*);
+                },
+                .SetUpvalue => {
+                    const slot = frame.byte();
+                    frame.closure.upvalues[slot].location.* = vm.peek(0);
+                },
+                .GetUpvalue => {
+                    const slot = frame.byte();
+                    vm.push(frame.closure.upvalues[slot].location.*);
+                },
+                .CloseUpvalue => {
+                    try vm.closeUpvalues(&vm.stack[vm.stackTop - 1]);
+                    _ = vm.pop();
                 },
                 .Nil => vm.push(.nil),
                 .True => vm.push(Value{ .bool = true }),
@@ -769,6 +815,7 @@ pub const VM = struct {
                 },
                 .Return => {
                     const result = vm.pop();
+                    try vm.closeUpvalues(&frame.slots[0]);
                     vm.frameCount -= 1;
                     if (vm.frameCount == 0) {
                         // Pop the script function off the stack.
@@ -838,8 +885,8 @@ pub const VM = struct {
                     const argCount = frame.byte();
                     switch (vm.peek(argCount)) {
                         .obj => switch (vm.peek(argCount).obj.*) {
-                            .function => |*function| {
-                                frame = try vm.call(function, argCount);
+                            .closure => |*closure| {
+                                frame = try vm.call(closure, argCount);
                             },
                             .native => |native| {
                                 const args = vm.stack[vm.stackTop - argCount .. vm.stackTop];
@@ -858,6 +905,29 @@ pub const VM = struct {
                             try vm.io.flush();
                             return .RuntimeError;
                         },
+                    }
+                },
+                .Closure => {
+                    const constant = frame.constant();
+                    if (constant.asFunction()) |function| {
+                        const closure = try Closure.init(vm.alloc, function);
+                        errdefer closure.deinit(vm.alloc);
+                        try vm.pushObj(.{ .closure = closure });
+
+                        // Capture upvalues.
+                        for (closure.upvalues) |*upvalue| {
+                            const isLocal = frame.byte();
+                            const index = frame.byte();
+                            if (isLocal == 1) {
+                                upvalue.* = try vm.captureUpvalue(&frame.slots[index]);
+                            } else {
+                                upvalue.* = frame.closure.upvalues[index];
+                            }
+                        }
+                    } else {
+                        try vm.io.print("Expected function, got {f}!\n", .{constant});
+                        try vm.io.flush();
+                        return .RuntimeError;
                     }
                 },
             }
@@ -885,9 +955,10 @@ pub const VM = struct {
         return obj;
     }
 
-    fn call(vm: *VM, callee: *const Function, argCount: usize) !*CallFrame {
-        if (argCount != callee.arity) {
-            try vm.io.print("Expected {d} arguments but got {d}!\n", .{ callee.arity, argCount });
+    fn call(vm: *VM, callee: *const Closure, argCount: usize) !*CallFrame {
+        const arity = callee.function.arity;
+        if (argCount != arity) {
+            try vm.io.print("Expected {d} arguments but got {d}!\n", .{ arity, argCount });
             try vm.io.flush();
             return error.RuntimeError;
         }
@@ -897,13 +968,51 @@ pub const VM = struct {
             return error.RuntimeError;
         }
         vm.frames[vm.frameCount] = CallFrame{
-            .function = callee,
+            .closure = callee,
             .ip = 0,
             .slots = vm.stack[vm.stackTop - argCount - 1 ..],
         };
         const frame = &vm.frames[vm.frameCount];
         vm.frameCount += 1;
         return frame;
+    }
+
+    fn captureUpvalue(vm: *VM, local: *Value) !*Upvalue {
+        var prevUpvalue: ?*Upvalue = null;
+        var upvalue = vm.openUpvalues;
+
+        // We're looking for an upvalue for the `local` pointer, which is
+        // guaranteed to be sorted in descending order in the linked list.
+        while (upvalue) |u| {
+            if (u.location == local) {
+                return u;
+            } else if (@intFromPtr(u.location) < @intFromPtr(local)) {
+                break;
+            }
+            prevUpvalue = upvalue;
+            upvalue = u.next;
+        }
+
+        const created = try vm.createObject(.{ .upvalue = .{ .location = local } });
+        const createdUpvalue = &created.upvalue;
+        createdUpvalue.next = upvalue;
+
+        if (prevUpvalue) |prev| {
+            prev.next = createdUpvalue;
+        } else {
+            vm.openUpvalues = createdUpvalue;
+        }
+
+        return createdUpvalue;
+    }
+
+    fn closeUpvalues(vm: *VM, last: *Value) !void {
+        while (vm.openUpvalues) |upvalue| {
+            if (@intFromPtr(upvalue.location) < @intFromPtr(last)) break;
+            upvalue.closed = upvalue.location.*;
+            upvalue.location = &upvalue.closed;
+            vm.openUpvalues = upvalue.next;
+        }
     }
 
     fn binop(vm: *VM, comptime code: OpCode) !void {
@@ -1220,20 +1329,28 @@ fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
-const Local = struct {
-    name: Token,
-    depth: i32,
-};
-
 const MAX_LOCALS = 128;
 
 const Compiler = struct {
     const Self = @This();
 
+    const Local = struct {
+        name: Token,
+        depth: i32,
+        isCaptured: bool = false,
+    };
+
+    const UpvalueRef = struct {
+        index: u8,
+        isLocal: bool,
+    };
+
     writer: ChunkWriter,
+    upvalues: [MAX_LOCALS]UpvalueRef = undefined,
     locals: [MAX_LOCALS]Local = undefined,
     localCount: u8 = 1, // First slot is reserved for VM internal use.
     scopeDepth: i32 = 0,
+    enclosing: ?*Self = null,
 
     fn init(alloc: std.mem.Allocator, typ: FunctionType) Compiler {
         var compiler = Compiler{ .writer = ChunkWriter.init(alloc, typ) };
@@ -1290,6 +1407,37 @@ const Compiler = struct {
         return null;
     }
 
+    fn resolveUpvalue(self: *Self, name: Token) !?u8 {
+        // We need an enclosing function to have an upvalue.
+        if (self.enclosing) |enclosing| {
+            if (try enclosing.resolveLocal(name)) |local| {
+                enclosing.locals[local].isCaptured = true;
+                return try self.addUpvalue(local, true);
+            } else if (try enclosing.resolveUpvalue(name)) |upvalue| {
+                return try self.addUpvalue(upvalue, false);
+            }
+        }
+        return null;
+    }
+
+    fn addUpvalue(self: *Self, index: u8, isLocal: bool) !u8 {
+        const upvalueCount = self.writer.upvalueCount;
+        for (0..upvalueCount) |i| {
+            const upvalue = self.upvalues[i];
+            if (upvalue.index == index and upvalue.isLocal == isLocal) {
+                return @intCast(i);
+            }
+        }
+
+        if (upvalueCount == MAX_LOCALS) {
+            return error.TooManyLocals;
+        }
+
+        self.upvalues[upvalueCount] = .{ .index = index, .isLocal = isLocal };
+        self.writer.upvalueCount += 1;
+        return @intCast(upvalueCount);
+    }
+
     fn definesInSubscope(self: *Self, name: Token) bool {
         if (self.localCount == 0) return false;
 
@@ -1312,7 +1460,6 @@ const ParseError = error{
     InvalidCharacter,
     JumpTooLong,
     WriteFailed,
-    TestExpectedEqual, // TODO: REMOVE!
 };
 
 const Parser = struct {
@@ -1679,10 +1826,15 @@ const Parser = struct {
     }
 
     fn endScope(parser: *Parser) !void {
-        const localCount = parser.compiler.pop();
+        var localCount = parser.compiler.pop();
 
-        for (0..localCount) |_| {
-            try parser.writer.emitOp(.Pop);
+        while (localCount > 0) {
+            localCount -= 1;
+            if (parser.compiler.locals[localCount].isCaptured) {
+                try parser.writer.emitOp(.CloseUpvalue);
+            } else {
+                try parser.writer.emitOp(.Pop);
+            }
         }
     }
 
@@ -1715,6 +1867,7 @@ const Parser = struct {
 
     fn function(parser: *Parser, funTy: FunctionType) !void {
         var compiler = Compiler.init(parser.alloc, funTy);
+        compiler.enclosing = parser.compiler;
         defer compiler.deinit();
 
         const nameBytes = parser.previous.source;
@@ -1766,7 +1919,13 @@ const Parser = struct {
         errdefer parser.alloc.destroy(obj);
         obj.* = Object{ .function = func };
         const index = try parser.writer.makeConstant(Value{ .obj = obj });
-        try parser.writer.emitConstant(index);
+        try parser.writer.emitOp(.Closure);
+        try parser.writer.emit(index);
+
+        for (0..compiler.writer.upvalueCount) |i| {
+            try parser.writer.emit(if (compiler.upvalues[i].isLocal) 1 else 0);
+            try parser.writer.emit(compiler.upvalues[i].index);
+        }
     }
 
     fn emitReturn(parser: *Parser) !void {
@@ -1833,15 +1992,20 @@ const Parser = struct {
         var set: OpCode = .SetGlobal;
         var index: u8 = 0;
 
-        const res = parser.compiler.resolveLocal(token) catch {
+        if (parser.compiler.resolveLocal(token) catch {
             parser.errorAt(token, "Can't read local variable in its own initializer.");
             return;
-        };
-
-        if (res) |i| {
+        }) |i| {
             index = i;
             get = .GetLocal;
             set = .SetLocal;
+        } else if (parser.compiler.resolveUpvalue(token) catch {
+            parser.errorAt(token, "Can't read upvalue in its own initializer.");
+            return;
+        }) |i| {
+            index = i;
+            get = .GetUpvalue;
+            set = .SetUpvalue;
         } else {
             index = try parser.identifierConstant(token);
         }
@@ -2117,23 +2281,137 @@ test "native" {
     , output.written());
 }
 
-// test "closure" {
-//     try run(
-//         \\fun makeCounter() {
-//         \\  var i = 0;
-//         \\  fun count() {
-//         \\    i = i + 1;
-//         \\    print i;
-//         \\  }
-//         \\  return count;
-//         \\}
-//         \\
-//         \\var counter = makeCounter();
-//         \\counter();
-//         \\counter();
-//     ,
-//         \\1
-//         \\2
-//         \\
-//     );
-// }
+test "read outer scope upvalue" {
+    try run(
+        \\ var x = "global";
+        \\ fun outer() {
+        \\   var x = "outer";
+        \\   fun inner() {
+        \\     print x;
+        \\   }
+        \\   inner();
+        \\ }
+        \\ outer();
+    ,
+        \\outer
+        \\
+    );
+}
+
+test "assign upvalue" {
+    try run(
+        \\ fun outer() {
+        \\   var x = "before";
+        \\   fun inner() {
+        \\     x = "assigned";
+        \\   }
+        \\   inner();
+        \\   print x;
+        \\ }
+        \\ outer();
+    ,
+        \\assigned
+        \\
+    );
+}
+
+test "closed upvalue" {
+    try run(
+        \\ fun outer() {
+        \\   var x = "outside";
+        \\   fun inner() {
+        \\     print x;
+        \\   }
+        \\
+        \\   return inner;
+        \\ }
+        \\ var closure = outer();
+        \\ closure();
+    ,
+        \\outside
+        \\
+    );
+}
+
+test "get/set upvalue" {
+    try run(
+        \\ var globalSet;
+        \\ var globalGet;
+        \\ 
+        \\ fun main() {
+        \\   var a = "initial";
+        \\ 
+        \\   fun set() { a = "updated"; }
+        \\   fun get() { print a; }
+        \\ 
+        \\   globalSet = set;
+        \\   globalGet = get;
+        \\ }
+        \\main();
+        \\globalSet();
+        \\globalGet();
+    ,
+        \\updated
+        \\
+    );
+}
+
+test "closure" {
+    try run(
+        \\fun makeCounter() {
+        \\  var i = 0;
+        \\  fun count() {
+        \\    i = i + 1;
+        \\    print i;
+        \\  }
+        \\  return count;
+        \\}
+        \\
+        \\var counter = makeCounter();
+        \\counter();
+        \\counter();
+    ,
+        \\1
+        \\2
+        \\
+    );
+}
+
+test "lots of as" {
+    try run(
+        \\var a = "a";
+        \\a = "a";
+        \\print a;
+    ,
+        \\a
+        \\
+    );
+}
+
+test "loop closures" {
+    try run(
+        \\ var globalOne;
+        \\ var globalTwo;
+        \\ 
+        \\ fun main() {
+        \\   for (var a = 1; a <= 2; a = a + 1) {
+        \\     fun closure() {
+        \\       print a;
+        \\     }
+        \\     if (globalOne == nil) {
+        \\       globalOne = closure;
+        \\     } else {
+        \\       globalTwo = closure;
+        \\     }
+        \\   }
+        \\ }
+        \\ 
+        \\ main();
+        \\ globalOne();
+        \\ globalTwo();
+    ,
+        \\3
+        \\3
+        \\
+    );
+}
