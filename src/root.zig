@@ -593,7 +593,7 @@ pub const VM = struct {
     stackTop: usize = 0,
 
     // Interned strings.
-    strings: StringMap(void) = .empty,
+    strings: StringMap(*Object) = .empty,
     globals: StringMap(Value) = .empty,
 
     // A linked list of all allocated objects.
@@ -615,14 +615,11 @@ pub const VM = struct {
     }
 
     pub fn deinit(vm: *VM) void {
-        var keys = vm.strings.keyIterator();
-        while (keys.next()) |key| {
-            vm.alloc.free(key.chars);
-        }
         vm.strings.deinit(vm.alloc);
         vm.globals.deinit(vm.alloc);
 
         while (vm.objects) |n| {
+            n.data.deinit(vm.alloc);
             vm.objects = n.next;
             vm.alloc.destroy(n);
         }
@@ -632,17 +629,17 @@ pub const VM = struct {
         var parser = try Parser.init(vm.alloc, source);
         defer parser.deinit();
 
-        var func = try parser.compile();
-        defer func.deinit(vm.alloc);
+        const func = try parser.compile();
+        errdefer func.deinit(vm.alloc);
 
         if (comptime debug.PrintBytecode) {
             try func.debugDisassemble();
         }
 
-        return vm.run(&func);
+        return vm.run(func);
     }
 
-    fn obj(vm: *VM, data: Object) !*Object {
+    fn createObject(vm: *VM, data: Object) !*Object {
         const node = try vm.alloc.create(ObjectNode);
         node.* = ObjectNode{ .next = vm.objects, .data = data };
         vm.objects = node;
@@ -659,16 +656,16 @@ pub const VM = struct {
         const string = String.unowned(name);
 
         // Storing the string in the interning table ensures it is freed.
-        const str = try vm.intern(string);
+        _ = try vm.intern(string);
 
-        const nativeObj = try vm.obj(Object{ .native = .{ .function = function } });
+        const nativeObj = try vm.createObject(.{ .native = .{ .function = function } });
 
-        try vm.globals.put(vm.alloc, str, Value{ .obj = nativeObj });
+        try vm.globals.put(vm.alloc, string, .{ .obj = nativeObj });
     }
 
-    fn run(vm: *VM, func: *const Function) !Result {
-        try vm.pushObj(.{ .function = func.* });
-        _ = try vm.call(func, 0);
+    fn run(vm: *VM, func: Function) !Result {
+        try vm.pushObj(.{ .function = func });
+        _ = try vm.call(&func, 0);
 
         return vm.runLoop() catch |err| switch (err) {
             error.RuntimeError => {
@@ -706,7 +703,7 @@ pub const VM = struct {
 
                     if (constant.asString()) |str| {
                         const interned = try vm.intern(str);
-                        try vm.pushObj(Object{ .string = interned });
+                        vm.push(.{ .obj = interned });
                     } else {
                         vm.push(constant);
                     }
@@ -715,7 +712,7 @@ pub const VM = struct {
                     const constant = frame.constant();
                     if (constant.asString()) |str| {
                         const interned = try vm.intern(str);
-                        try vm.globals.put(vm.alloc, interned, vm.peek(0));
+                        try vm.globals.put(vm.alloc, interned.string, vm.peek(0));
                         _ = vm.pop();
                     } else {
                         try vm.io.print("Expected string, got {f}!\n", .{constant});
@@ -873,17 +870,19 @@ pub const VM = struct {
 
     // Interns a string and returns the interned version. The returned string
     // is owned by the VM and will be freed when the VM is deinitialized.
-    fn intern(vm: *VM, str: String) !String {
+    fn intern(vm: *VM, str: String) !*Object {
         // If we've already interned the string, use that instance.
-        if (vm.strings.getKey(str)) |string| {
+        if (vm.strings.get(str)) |string| {
             return string;
         }
 
         // Otherwise, allocate a new one.
         var string = try String.init(vm.alloc, str.chars);
         errdefer string.deinit(vm.alloc);
-        try vm.strings.put(vm.alloc, string, undefined);
-        return string;
+        const obj = try vm.createObject(.{ .string = string });
+        errdefer obj.deinit(vm.alloc);
+        try vm.strings.put(vm.alloc, string, obj);
+        return obj;
     }
 
     fn call(vm: *VM, callee: *const Function, argCount: usize) !*CallFrame {
@@ -949,8 +948,14 @@ pub const VM = struct {
         if (entry.found_existing) {
             // Free old allocation.
             vm.alloc.free(result);
+            vm.push(Value{ .obj = entry.value_ptr.* });
+        } else {
+            // We need to allocate a new string object for the concatenated string.
+            const o = try vm.createObject(.{ .string = string });
+            errdefer o.deinit(vm.alloc);
+            try vm.strings.put(vm.alloc, string, o);
+            vm.push(Value{ .obj = o });
         }
-        try vm.pushObj(Object{ .string = entry.key_ptr.* });
     }
 
     fn peek(vm: *VM, distance: usize) Value {
@@ -963,7 +968,7 @@ pub const VM = struct {
     }
 
     fn pushObj(vm: *VM, object: Object) !void {
-        vm.push(Value{ .obj = try vm.obj(object) });
+        vm.push(Value{ .obj = try vm.createObject(object) });
     }
 
     fn pop(vm: *VM) Value {
