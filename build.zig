@@ -41,6 +41,30 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Create a Wasm module that can interpret Lox scripts.
+    const wasm = b.addExecutable(.{
+        .name = "zlox",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .wasm32,
+                .os_tag = .freestanding,
+                .cpu_features_add = std.Target.wasm.featureSet(&.{
+                    .atomics,
+                    .bulk_memory,
+                    .tail_call,
+                }),
+            }),
+            .optimize = .ReleaseSmall,
+            .imports = &.{
+                .{ .name = "zlox", .module = mod },
+            },
+        }),
+    });
+    wasm.rdynamic = true;
+    wasm.entry = .disabled;
+    b.installArtifact(wasm);
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business

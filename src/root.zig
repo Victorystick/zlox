@@ -2,8 +2,11 @@
 const std = @import("std");
 
 const debug = .{
-    .PrintBytecode = true,
+    .PrintBytecode = false,
     .TraceExecution = false,
+    // Must be false in Wasm since it relies on std.debug.print, which is not
+    // available in that target.
+    .PrintErrors = false,
 };
 
 const ValueType = enum {
@@ -1531,15 +1534,18 @@ const Parser = struct {
     fn errorAt(parser: *Parser, token: Token, text: []const u8) void {
         if (parser.panicMode) return;
         parser.panicMode = true;
-        std.debug.print("[line {d}] Error", .{token.line});
 
-        switch (token.type) {
-            .Eof => std.debug.print(" at end", .{}),
-            .Error => {},
-            else => std.debug.print(" at '{s}'", .{token.source}),
+        if (debug.PrintErrors) {
+            std.debug.print("[line {d}] Error", .{token.line});
+
+            switch (token.type) {
+                .Eof => std.debug.print(" at end", .{}),
+                .Error => {},
+                else => std.debug.print(" at '{s}'", .{token.source}),
+            }
+
+            std.debug.print(": {s}\n", .{text});
         }
-
-        std.debug.print(": {s}\n", .{text});
         parser.hadError = true;
     }
 
