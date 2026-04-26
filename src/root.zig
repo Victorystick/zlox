@@ -7,6 +7,8 @@ const debug = .{
     // Must be false in Wasm since it relies on std.debug.print, which is not
     // available in that target.
     .PrintErrors = false,
+    .StressGC = false,
+    .LogGC = false,
 };
 
 const ValueType = enum {
@@ -79,10 +81,7 @@ pub const Value = union(ValueType) {
 
     fn asString(self: Value) ?String {
         return switch (self) {
-            .obj => switch (self.obj.*) {
-                .string => |s| s,
-                else => null,
-            },
+            .obj => self.obj.asString(),
             else => null,
         };
     }
@@ -94,6 +93,13 @@ pub const Value = union(ValueType) {
                 else => null,
             },
             else => null,
+        };
+    }
+
+    fn mark(self: Value) void {
+        return switch (self) {
+            .obj => |o| o.mark(),
+            else => {},
         };
     }
 };
@@ -127,11 +133,11 @@ const String = struct {
     }
 };
 const StringHashing = struct {
-    pub fn hash(self: @This(), s: String) u64 {
+    pub fn hash(self: @This(), s: *const String) u64 {
         _ = self;
         return s.hash;
     }
-    pub fn eql(self: @This(), a: String, b: String) bool {
+    pub fn eql(self: @This(), a: *const String, b: *const String) bool {
         _ = self;
         return std.mem.eql(u8, a.chars, b.chars);
     }
@@ -171,8 +177,9 @@ const Function = struct {
 
     fn debugDisassemble(self: *const Function) !void {
         var buf: [1024]u8 = undefined;
-        const io = std.debug.lockStderrWriter(&buf);
-        defer std.debug.unlockStderrWriter();
+        const stderr = std.debug.lockStderr(&buf);
+        defer std.debug.unlockStderr();
+        var io = &stderr.file_writer.interface;
         try self.disassemble(io);
         try io.flush();
     }
@@ -239,14 +246,34 @@ const Object = union(ObjectType) {
     upvalue: Upvalue,
 
     pub fn deinit(self: Object, alloc: std.mem.Allocator) void {
+        if (comptime debug.LogGC) {
+            std.debug.print("  Free    {s: <10}: {f}\n", .{ switch (self) {
+                .string => "string",
+                .function => "function",
+                .native => "native",
+                .closure => "closure",
+                .upvalue => "upvalue",
+            }, self });
+        }
         switch (self) {
-            // Handled elsewhere since strings are interned and may be shared between multiple objects.
             .string => |string| string.deinit(alloc),
             .function => |function| function.deinit(alloc),
             .closure => |closure| closure.deinit(alloc),
             .upvalue => {},
             .native => {},
         }
+    }
+
+    fn asString(self: *Object) ?String {
+        return switch (self.*) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
+    fn mark(self: *Object) void {
+        const node: *VM.ObjectNode = @fieldParentPtr("data", self);
+        node.isMarked = true;
     }
 
     pub fn format(self: Object, writer: *std.Io.Writer) !void {
@@ -301,11 +328,16 @@ const OpCode = enum(u8) {
 const Chunk = struct {
     code: []u8 = undefined,
     constants: []Value = undefined,
+    /// When true, this chunk owns its object constants and will free them on deinit.
+    /// Set to false for GC-managed chunks where the GC owns the object constants.
+    ownsObjects: bool = true,
 
     pub fn deinit(self: Chunk, alloc: std.mem.Allocator) void {
         alloc.free(self.code);
-        for (self.constants) |constant| {
-            constant.deinit(alloc);
+        if (self.ownsObjects) {
+            for (self.constants) |constant| {
+                constant.deinit(alloc);
+            }
         }
         alloc.free(self.constants);
     }
@@ -558,7 +590,7 @@ pub const ChunkWriter = struct {
 };
 
 fn StringMap(comptime V: type) type {
-    return std.hash_map.HashMapUnmanaged(String, V, StringHashing, 80);
+    return std.hash_map.HashMapUnmanaged(*const String, V, StringHashing, 80);
 }
 
 // A call frame represents a single function invocation. It keeps track of the
@@ -625,9 +657,12 @@ pub const VM = struct {
 
     // A linked list of all allocated objects.
     objects: ?*ObjectNode = null,
+    grayStack: std.ArrayList(*ObjectNode) = .empty,
+    isCollecting: bool = false,
 
     const ObjectNode = struct {
         next: ?*ObjectNode,
+        isMarked: bool = false,
         data: Object,
     };
 
@@ -644,11 +679,187 @@ pub const VM = struct {
     pub fn deinit(vm: *VM) void {
         vm.strings.deinit(vm.alloc);
         vm.globals.deinit(vm.alloc);
+        vm.grayStack.deinit(vm.alloc);
 
         while (vm.objects) |n| {
             n.data.deinit(vm.alloc);
             vm.objects = n.next;
             vm.alloc.destroy(n);
+        }
+    }
+
+    fn gc(vm: *VM) !void {
+        if (vm.isCollecting) {
+            // This can happen if GC is triggered during GC, for example by a native function. In that case, we just skip the nested GC call.
+            std.debug.print("-- GC already in progress\n", .{});
+            return;
+        }
+        vm.isCollecting = true;
+        defer vm.isCollecting = false;
+
+        if (comptime debug.LogGC) {
+            std.debug.print("-- GC begin\n", .{});
+        }
+
+        try vm.markRoots();
+        try vm.traceReferences();
+        // try vm.removeUnreachableStrings();
+        vm.sweep();
+
+        if (comptime debug.LogGC) {
+            std.debug.print("-- GC end\n", .{});
+        }
+    }
+
+    fn markRoots(vm: *VM) !void {
+        for (vm.stack[0..vm.stackTop]) |*val| {
+            try vm.markValue(val);
+        }
+
+        // The book says to also mark the strings, but I store them
+        // differently. Let's see if this causes any issues.
+        var globals = vm.globals.iterator();
+        while (globals.next()) |entry| {
+            // The key_ptr points to the ObjectNode in the global map.
+            // It must be cast to *Object to use vm.mark
+            try vm.mark(@constCast(@fieldParentPtr("string", entry.key_ptr.*)));
+            try vm.markValue(entry.value_ptr);
+        }
+
+        for (vm.frames[0..vm.frameCount]) |frame| {
+            const o: *Object = @constCast(@fieldParentPtr("closure", frame.closure));
+            try vm.mark(o);
+        }
+
+        var nextUpvalue = vm.openUpvalues;
+        while (nextUpvalue) |upvalue| {
+            const o: *Object = @constCast(@fieldParentPtr("upvalue", upvalue));
+            try vm.mark(o);
+            nextUpvalue = upvalue.next;
+        }
+
+        // TODO: Do we need to cover compiler roots? In the book, the compiler
+        // is closer connected to the VM than it is here.
+    }
+
+    fn markValue(vm: *VM, val: *Value) !void {
+        switch (val.*) {
+            .obj => |o| try vm.mark(o),
+            else => {},
+        }
+    }
+
+    fn mark(vm: *VM, o: *Object) !void {
+        const n: *ObjectNode = @fieldParentPtr("data", o);
+        if (n.isMarked) return;
+        if (comptime debug.LogGC) {
+            std.debug.print("  Marking {s: <10}: {f}\n", .{ switch (o.*) {
+                .string => "string",
+                .function => "function",
+                .native => "native",
+                .closure => "closure",
+                .upvalue => "upvalue",
+            }, o });
+        }
+        n.isMarked = true;
+        switch (o.*) {
+            .string, .native => {},
+            else => try vm.grayStack.append(vm.alloc, n),
+        }
+    }
+
+    /// Traces all gray stack (in progress) objects and marks reachable references.
+    fn traceReferences(vm: *VM) !void {
+        while (vm.grayStack.items.len > 0) {
+            const node = vm.grayStack.items[vm.grayStack.items.len - 1];
+            vm.grayStack.items.len -= 1;
+
+            switch (node.data) {
+                .string => {},
+                .function => |function| {
+                    for (function.chunk.constants) |*constant| {
+                        try vm.markValue(constant);
+                    }
+                },
+                .native => {},
+                .closure => |closure| {
+                    try vm.mark(@constCast(@fieldParentPtr("function", closure.function)));
+                    for (closure.upvalues) |upvalue| {
+                        try vm.mark(@fieldParentPtr("upvalue", upvalue));
+                    }
+                },
+                .upvalue => |upvalue| {
+                    try vm.markValue(upvalue.location);
+                },
+            }
+        }
+    }
+
+    // /// Removes unreachable (unmarked) strings from the intern map. The actual
+    // /// Objects contained within it are removed in sweep.
+    // fn removeUnreachableStrings(vm: *VM) !void {
+    //     var unused_keys: std.ArrayList(*const String) = .empty;
+    //     defer unused_keys.deinit(vm.alloc);
+
+    //     var strings = vm.strings.iterator();
+    //     while (strings.next()) |entry| {
+    //         const obj: *Object = entry.value_ptr.*;
+    //         const node: *ObjectNode = @fieldParentPtr("data", obj);
+    //         if (!node.isMarked) {
+    //             std.debug.print("  Removing unreachable string: {s}\n", .{entry.value_ptr.*.string.chars});
+    //             try unused_keys.append(vm.alloc, entry.key_ptr.*);
+    //         }
+    //     }
+
+    //     for (unused_keys.items) |key| {
+    //         _ = vm.strings.remove(key);
+    //     }
+    // }
+
+    test "remove unreachable strings" {
+        var disc: std.Io.Writer.Discarding = .init(&.{});
+        var stack: [50]Value = undefined;
+        var vm = VM.init(std.testing.allocator, &disc.writer, &stack);
+        defer vm.deinit();
+
+        _ = try vm.intern(String.unowned("str1"));
+        _ = try vm.intern(String.unowned("str2"));
+
+        try vm.gc();
+
+        try std.testing.expectEqual(2, vm.strings.size);
+
+        _ = vm.pop();
+        _ = vm.pop();
+
+        try vm.gc();
+
+        try std.testing.expectEqual(0, vm.strings.size);
+    }
+
+    /// Walks the linked list of object nodes and deallocates any that aren't marked.
+    fn sweep(vm: *VM) void {
+        var previous: ?*VM.ObjectNode = null;
+        var current = vm.objects;
+        while (current) |node| {
+            if (node.isMarked) {
+                node.isMarked = false;
+                previous = current;
+                current = node.next;
+            } else {
+                current = node.next;
+                if (previous) |prev| {
+                    prev.next = current;
+                } else {
+                    vm.objects = current;
+                }
+
+                if (node.data.asString()) |*string| {
+                    _ = vm.strings.remove(string);
+                }
+                node.data.deinit(vm.alloc);
+                vm.alloc.destroy(node);
+            }
         }
     }
 
@@ -670,41 +881,59 @@ pub const VM = struct {
 
     fn createObject(vm: *VM, data: Object) !*Object {
         const node = try vm.alloc.create(ObjectNode);
+        if (comptime debug.LogGC) {
+            std.debug.print("  Alloc   {s: <10}: {f}\n", .{ switch (data) {
+                .string => "string",
+                .function => "function",
+                .native => "native",
+                .closure => "closure",
+                .upvalue => "upvalue",
+            }, data });
+        }
         node.* = ObjectNode{ .next = vm.objects, .data = data };
         vm.objects = node;
         return &node.data;
     }
 
     fn defineNative(vm: *VM, name: []const u8, function: NativeFn) !void {
-        // TODO: Verify avoiding push/pop doesn't break GC. Originally:
-        //   push(OBJ_VAL(copyString(name, (int)strlen(name))));
-        //   push(OBJ_VAL(newNative(function)));
-        //   tableSet(&vm.globals, AS_STRING(vm.stack[0]), vm.stack[1]);
-        //   pop();
-        //   pop()
-        const string = String.unowned(name);
+        // Both the string and the native function are stored on the stack
+        // so as not to be garbage collected.
+        const strObj = try vm.intern(String.unowned(name));
+        const nativeObj = try vm.pushObj(.{ .native = .{ .function = function } });
 
-        // Storing the string in the interning table ensures it is freed.
-        _ = try vm.intern(string);
+        try vm.globals.put(vm.alloc, &strObj.string, .{ .obj = nativeObj });
 
-        const nativeObj = try vm.createObject(.{ .native = .{ .function = function } });
-
-        try vm.globals.put(vm.alloc, string, .{ .obj = nativeObj });
+        _ = vm.pop();
+        _ = vm.pop();
     }
 
     // Takes ownership of the function.
     fn run(vm: *VM, func: Function) !Result {
-        try vm.pushObj(.{ .function = func });
+        // Implicit assumtion: The function has arity 0.
+        const fnObj = try blk: {
+            defer func.deinit(vm.alloc);
+
+            // The function that gets passed in does itself owns all its values.
+            // This is a problem since the VM may need to keep (at least parts
+            // of) the function alive after the run() function returns. To solve
+            // this, the VM clones the function.
+            break :blk vm.cloneFn(func);
+        };
 
         const o = try blk: {
-            const closure = try Closure.init(vm.alloc, &func);
+            const closure = try Closure.init(vm.alloc, &fnObj.function);
             errdefer closure.deinit(vm.alloc);
             break :blk vm.createObject(.{ .closure = closure });
         };
         _ = vm.pop();
-        try vm.pushObj(.{ .closure = o.closure });
+        vm.push(.{ .obj = o });
 
         _ = try vm.call(&o.closure, 0);
+
+        if (comptime debug.LogGC) {
+            std.debug.print("Starting execution\n", .{});
+        }
+        defer if (comptime debug.LogGC) std.debug.print("Finished execution\n", .{});
 
         return vm.runLoop() catch |err| switch (err) {
             error.RuntimeError => {
@@ -719,21 +948,98 @@ pub const VM = struct {
         };
     }
 
+    fn cloneChunk(vm: *VM, chunk: *const Chunk) ParseError!Chunk {
+        const code = try vm.alloc.alloc(u8, chunk.code.len);
+        errdefer vm.alloc.free(code);
+        @memcpy(code, chunk.code);
+
+        const constants = try vm.alloc.alloc(Value, chunk.constants.len);
+        errdefer vm.alloc.free(constants);
+
+        // While non-object constants can be copied as-is, objects need to be
+        // cloned so they don't get freed when the original function gets
+        // freed. To ensure they don't get GC:ed during cloning, we push them
+        // onto the stack and pop them off after we're done.
+        var objectCount: usize = 0;
+        for (0..chunk.constants.len) |i| {
+            switch (chunk.constants[i]) {
+                .obj => |o| {
+                    objectCount += 1;
+                    switch (o.*) {
+                        .string => |string| {
+                            const obj = try vm.intern(string);
+                            constants[i] = Value{ .obj = obj };
+                        },
+                        .function => |function| {
+                            const obj = try vm.cloneFn(function);
+                            constants[i] = Value{ .obj = obj };
+                        },
+                        // All other types only exist at runtime.
+                        else => @panic("Found unexpected object type in constants!"),
+                    }
+                },
+                else => {
+                    constants[i] = chunk.constants[i];
+                },
+            }
+            try vm.printStack(null);
+        }
+
+        // Pop the objects we pushed onto the stack to keep them alive during cloning.
+        for (0..objectCount) |_| {
+            _ = vm.pop();
+        }
+
+        return Chunk{
+            .code = code,
+            .constants = constants,
+            .ownsObjects = false,
+        };
+    }
+
+    fn cloneFn(vm: *VM, func: Function) !*Object {
+        try vm.printStack(null);
+        // This copy is safe, as long as we replace the chunk and name with
+        // empty values before any other memory allocation occurs. Otherwise,
+        // we risk treating the constants of the function as ObjectNodes and
+        // marking them during GC, clobbering any surrounding memory.
+        var obj = try vm.pushObj(.{ .function = func });
+        const copy = &obj.function;
+        copy.name = null;
+        copy.chunk = Chunk{ .code = &[_]u8{}, .constants = &[_]Value{} };
+        try vm.printStack(null);
+
+        copy.chunk = try vm.cloneChunk(&func.chunk);
+        errdefer copy.chunk.deinit(vm.alloc);
+        if (func.name) |name| {
+            copy.name = try String.init(vm.alloc, name.chars);
+        }
+        try vm.printStack(null);
+        return obj;
+    }
+
+    fn printStack(vm: *VM, frame: ?*const CallFrame) !void {
+        var buf: [1024]u8 = undefined;
+        const stderr = std.debug.lockStderr(&buf);
+        defer std.debug.unlockStderr();
+        var io = &stderr.file_writer.interface;
+        try io.writeAll("[ ");
+        for (vm.stack[0..vm.stackTop]) |val| {
+            try io.print("{f} ", .{val});
+        }
+        try io.writeAll("]\n");
+        if (frame) |f| {
+            _ = disassembleInstruction(&f.closure.function.chunk, f.ip, io) catch {};
+        }
+        try io.flush();
+    }
+
     fn runLoop(vm: *VM) !Result {
         var frame = &vm.frames[vm.frameCount - 1];
 
         while (frame.runnable()) {
             if (comptime debug.TraceExecution) {
-                var buf: [1024]u8 = undefined;
-                const io = std.debug.lockStderrWriter(&buf);
-                defer std.debug.unlockStderrWriter();
-                try io.writeAll("[ ");
-                for (vm.stack[0..vm.stackTop]) |val| {
-                    try io.print("{f} ", .{val});
-                }
-                try io.writeAll("]\n");
-                _ = disassembleInstruction(&frame.closure.function.chunk, frame.ip, io) catch {};
-                try io.flush();
+                try vm.printStack(frame);
             }
 
             switch (frame.op()) {
@@ -741,8 +1047,7 @@ pub const VM = struct {
                     const constant = frame.constant();
 
                     if (constant.asString()) |str| {
-                        const interned = try vm.intern(str);
-                        vm.push(.{ .obj = interned });
+                        _ = try vm.intern(str);
                     } else {
                         vm.push(constant);
                     }
@@ -751,7 +1056,8 @@ pub const VM = struct {
                     const constant = frame.constant();
                     if (constant.asString()) |str| {
                         const interned = try vm.intern(str);
-                        try vm.globals.put(vm.alloc, interned.string, vm.peek(0));
+                        try vm.globals.put(vm.alloc, &interned.string, vm.peek(1));
+                        _ = vm.pop();
                         _ = vm.pop();
                     } else {
                         try vm.io.print("Expected string, got {f}!\n", .{constant});
@@ -762,7 +1068,7 @@ pub const VM = struct {
                 .SetGlobal => {
                     const constant = frame.constant();
                     if (constant.asString()) |str| {
-                        if (vm.globals.getPtr(str)) |ptr| {
+                        if (vm.globals.getPtr(&str)) |ptr| {
                             ptr.* = vm.peek(0);
                         } else {
                             try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
@@ -778,7 +1084,7 @@ pub const VM = struct {
                 .GetGlobal => {
                     const constant = frame.constant();
                     if (constant.asString()) |str| {
-                        if (vm.globals.get(str)) |val| {
+                        if (vm.globals.get(&str)) |val| {
                             vm.push(val);
                         } else {
                             try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
@@ -824,6 +1130,9 @@ pub const VM = struct {
                         // Pop the script function off the stack.
                         _ = vm.pop();
                         try vm.io.flush();
+                        if (comptime debug.TraceExecution) {
+                            try vm.printStack(null);
+                        }
                         return .OK;
                     }
                     vm.stackTop = frame.slots.ptr - vm.stack.ptr;
@@ -900,7 +1209,7 @@ pub const VM = struct {
                             else => {
                                 try vm.io.print("Can only call functions and classes!\n", .{});
                                 try vm.io.flush();
-                                return .RuntimeError;
+                                return error.RuntimeError;
                             },
                         },
                         else => {
@@ -913,9 +1222,26 @@ pub const VM = struct {
                 .Closure => {
                     const constant = frame.constant();
                     if (constant.asFunction()) |function| {
+                        // Hack! Create an upvalue that points to the closure,
+                        // and use it for all upvalues before
+                        var val: Value = .{ .nil = {} };
+                        const tmp = try vm.pushObj(.{ .upvalue = .{ .location = &val } });
+                        defer _ = vm.pop();
+
                         const closure = try Closure.init(vm.alloc, function);
                         errdefer closure.deinit(vm.alloc);
-                        try vm.pushObj(.{ .closure = closure });
+                        const self = try vm.pushObj(.{ .closure = closure });
+
+                        // Hack! Swap the closure with the temp value.
+                        vm.swap();
+
+                        val = .{ .obj = self };
+
+                        // Hack! Point all upvalues to the closure itself. That
+                        // ensures that iterating
+                        for (closure.upvalues) |*upvalue| {
+                            upvalue.* = &tmp.upvalue;
+                        }
 
                         // Capture upvalues.
                         for (closure.upvalues) |*upvalue| {
@@ -945,16 +1271,19 @@ pub const VM = struct {
     // is owned by the VM and will be freed when the VM is deinitialized.
     fn intern(vm: *VM, str: String) !*Object {
         // If we've already interned the string, use that instance.
-        if (vm.strings.get(str)) |string| {
+        if (vm.strings.get(&str)) |string| {
+            if (comptime debug.LogGC) {
+                std.debug.print("  Interned: {s}\n", .{str.chars});
+            }
+            vm.push(.{ .obj = string });
             return string;
         }
 
         // Otherwise, allocate a new one.
         var string = try String.init(vm.alloc, str.chars);
         errdefer string.deinit(vm.alloc);
-        const obj = try vm.createObject(.{ .string = string });
-        errdefer obj.deinit(vm.alloc);
-        try vm.strings.put(vm.alloc, string, obj);
+        const obj = try vm.pushObj(.{ .string = string });
+        try vm.strings.put(vm.alloc, &obj.string, obj);
         return obj;
     }
 
@@ -1040,8 +1369,8 @@ pub const VM = struct {
 
     // Requires the top two values to be strings.
     fn concatenate(vm: *VM) !void {
-        const b = vm.pop();
-        const a = vm.pop();
+        const b = vm.peek(0);
+        const a = vm.peek(1);
 
         const first = a.obj.*.string.chars;
         const second = b.obj.*.string.chars;
@@ -1050,23 +1379,23 @@ pub const VM = struct {
 
         @memcpy(result[0..first.len], first);
         @memcpy(result[first.len..], second);
+        _ = vm.pop();
+        _ = vm.pop();
 
         const string = String{
             .chars = result,
             .hash = std.hash_map.hashString(result),
         };
 
-        const entry = try vm.strings.getOrPut(vm.alloc, string);
+        // We need to allocate a new string object for the concatenated string.
+        const o = try vm.pushObj(.{ .string = string });
+        const entry = try vm.strings.getOrPut(vm.alloc, &o.string);
         if (entry.found_existing) {
             // Free old allocation.
             vm.alloc.free(result);
             vm.push(Value{ .obj = entry.value_ptr.* });
         } else {
-            // We need to allocate a new string object for the concatenated string.
-            const o = try vm.createObject(.{ .string = string });
-            errdefer o.deinit(vm.alloc);
-            try vm.strings.put(vm.alloc, string, o);
-            vm.push(Value{ .obj = o });
+            entry.value_ptr.* = o;
         }
     }
 
@@ -1079,13 +1408,24 @@ pub const VM = struct {
         vm.stackTop += 1;
     }
 
-    fn pushObj(vm: *VM, object: Object) !void {
-        vm.push(Value{ .obj = try vm.createObject(object) });
+    fn pushObj(vm: *VM, object: Object) !*Object {
+        const obj = try vm.createObject(object);
+        vm.push(Value{ .obj = obj });
+        return obj;
     }
 
     fn pop(vm: *VM) Value {
         vm.stackTop -= 1;
         return vm.stack[vm.stackTop];
+    }
+
+    /// Swaps the top two elements on the stack.
+    fn swap(vm: *VM) void {
+        const top = vm.peek(0);
+        const second = vm.peek(1);
+
+        vm.stack[vm.stackTop - 1] = second;
+        vm.stack[vm.stackTop - 2] = top;
     }
 };
 
@@ -2078,7 +2418,78 @@ const Parser = struct {
     }
 };
 
+// GC metadata that we can access from the allocator hooks. We use this to
+// track how many bytes we've allocated, and trigger GC when we hit a certain
+// threshold.
+const GcMeta = struct {
+    vm: *VM,
+    alloc: std.mem.Allocator,
+    bytesAllocated: isize = 0,
+    nextGc: isize = 1024 * 1024,
+
+    fn init(vm: *VM) GcMeta {
+        return GcMeta{ .vm = vm, .alloc = vm.alloc };
+    }
+};
+
+const gcVtable = struct {
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = gcAlloc,
+        .resize = gcResize,
+        .remap = gcRemap,
+        .free = gcFree,
+    };
+
+    fn gc(self: *GcMeta) !void {
+        const before = self.bytesAllocated;
+        self.vm.gc() catch {};
+        if (comptime debug.LogGC) {
+            std.debug.print("GC: collected {d} bytes, {d} remaining\n", .{ before - self.bytesAllocated, self.bytesAllocated });
+        }
+    }
+
+    fn gcAlloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        // std.debug.print("Allocating {d} bytes\n", .{len});
+        var meta: *GcMeta = @ptrCast(@alignCast(ptr));
+        const res = meta.alloc.vtable.alloc(meta.alloc.ptr, len, alignment, ret_addr);
+        if (res) |_| {
+            meta.bytesAllocated += @intCast(len);
+            if (meta.bytesAllocated > meta.nextGc) {
+                meta.vm.gc() catch {};
+                meta.nextGc = meta.bytesAllocated * 2;
+            }
+        }
+        return res;
+    }
+
+    fn gcResize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        var meta: *GcMeta = @ptrCast(@alignCast(ptr));
+        // if (new_len > memory.len) {
+        //     triggerGC(ptr);
+        // }
+        return meta.alloc.vtable.resize(meta.alloc.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn gcRemap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        var meta: *GcMeta = @ptrCast(@alignCast(ptr));
+        // if (new_len > memory.len) {
+        //     triggerGC(ptr);
+        // }
+        return meta.alloc.vtable.remap(meta.alloc.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn gcFree(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        var meta: *GcMeta = @ptrCast(@alignCast(ptr));
+        meta.alloc.vtable.free(meta.alloc.ptr, memory, alignment, ret_addr);
+    }
+}.vtable;
+
 fn run(source: []const u8, expected_output: []const u8) !void {
+    return runs(&.{source}, expected_output);
+}
+
+/// Evaluates a number of scripts in sequence, asserting on their combined output.
+fn runs(source: []const []const u8, expected_output: []const u8) !void {
     const alloc = std.testing.allocator;
 
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -2089,9 +2500,89 @@ fn run(source: []const u8, expected_output: []const u8) !void {
     var vm = VM.init(alloc, output_writer, &stack);
     defer vm.deinit();
 
-    try std.testing.expectEqual(.OK, vm.interpret(source));
+    // Hooks into the GC system so we can track allocations and trigger GC when needed.
+    var gcMeta = GcMeta.init(&vm);
+    vm.alloc = .{
+        .ptr = &gcMeta,
+        .vtable = &gcVtable,
+    };
+
+    // Hacky, but works. We can't do this in init, since the VM struct isn't
+    // yet in its final memory location.
+    if (comptime debug.StressGC) {
+
+        // If we're stress testing the GC, we need to use a custom allocator
+        // that calls gc() before every allocation. Otherwise, we can just use
+        // the standard testing allocator.
+        vm.alloc = .{
+            .ptr = &vm,
+            .vtable = &struct {
+                const vtable = std.mem.Allocator.VTable{
+                    .alloc = stressAlloc,
+                    .resize = stressResize,
+                    .remap = stressRemap,
+                    .free = stressFree,
+                };
+
+                fn triggerGC(ptr: *anyopaque) void {
+                    @as(*VM, @ptrCast(@alignCast(ptr))).gc() catch {};
+                }
+
+                // We call GC before every allocation, so we can stress test it. We
+                // don't trigger GC when we free memory, since that risks putting
+                // us in an infinite loop.
+                fn stressAlloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+                    triggerGC(ptr);
+                    return std.testing.allocator.vtable.alloc(std.testing.allocator.ptr, len, alignment, ret_addr);
+                }
+
+                fn stressResize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+                    if (new_len > memory.len) {
+                        triggerGC(ptr);
+                    }
+                    return std.testing.allocator.vtable.resize(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
+                }
+
+                fn stressRemap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+                    if (new_len > memory.len) {
+                        triggerGC(ptr);
+                    }
+                    return std.testing.allocator.vtable.remap(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
+                }
+
+                fn stressFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+                    std.testing.allocator.vtable.free(std.testing.allocator.ptr, memory, alignment, ret_addr);
+                }
+            }.vtable,
+        };
+    }
+
+    for (source) |src| {
+        try std.testing.expectEqual(.OK, vm.interpret(src));
+
+        // Force a GC pass to run, so we can catch any issues with it.
+        try vm.gc();
+    }
 
     try std.testing.expectEqualStrings(expected_output, output.written());
+}
+
+test "nothing" {
+    try runs(&.{
+        \\
+        ,
+        \\
+    },
+        \\
+    );
+}
+
+test "string" {
+    try run(
+        \\"hello";
+    ,
+        \\
+    );
 }
 
 test "re-assign variable" {
@@ -2233,28 +2724,14 @@ test "function call" {
 }
 
 test "interpret twice" {
-    const alloc = std.testing.allocator;
-
-    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
-    const output_writer = &output.writer;
-    defer output.deinit();
-
-    var stack: [128]Value = undefined;
-    var vm = VM.init(alloc, output_writer, &stack);
-    defer vm.deinit();
-
-    try std.testing.expectEqual(.OK, vm.interpret(
+    try runs(&.{
         \\var a = 1;
-    ));
-
-    try std.testing.expectEqual(.OK, vm.interpret(
+        ,
         \\print a;
-    ));
-
-    try std.testing.expectEqualStrings(
+    },
         \\1
         \\
-    , output.written());
+    );
 }
 
 fn frameDepth(vm: *VM, _: []Value) NativeErr!Value {
@@ -2343,13 +2820,13 @@ test "get/set upvalue" {
     try run(
         \\ var globalSet;
         \\ var globalGet;
-        \\ 
+        \\
         \\ fun main() {
         \\   var a = "initial";
-        \\ 
+        \\
         \\   fun set() { a = "updated"; }
         \\   fun get() { print a; }
-        \\ 
+        \\
         \\   globalSet = set;
         \\   globalGet = get;
         \\ }
@@ -2398,7 +2875,7 @@ test "loop closures" {
     try run(
         \\ var globalOne;
         \\ var globalTwo;
-        \\ 
+        \\
         \\ fun main() {
         \\   for (var a = 1; a <= 2; a = a + 1) {
         \\     fun closure() {
@@ -2411,7 +2888,7 @@ test "loop closures" {
         \\     }
         \\   }
         \\ }
-        \\ 
+        \\
         \\ main();
         \\ globalOne();
         \\ globalTwo();
@@ -2420,4 +2897,45 @@ test "loop closures" {
         \\3
         \\
     );
+}
+
+test "print the same" {
+    try run(
+        \\var a = "a";
+        \\print a;
+        \\print a;
+    ,
+        \\a
+        \\a
+        \\
+    );
+}
+
+test "persist functions" {
+    const alloc = std.testing.allocator;
+
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    const output_writer = &output.writer;
+    defer output.deinit();
+
+    var stack: [128]Value = undefined;
+    var vm = VM.init(alloc, output_writer, &stack);
+    defer vm.deinit();
+
+    try std.testing.expectEqual(.OK, vm.interpret(
+        \\fun spooky() {
+        \\  print "boo!";
+        \\}
+    ));
+
+    vm.gc() catch {};
+
+    try std.testing.expectEqual(.OK, vm.interpret(
+        \\spooky();
+    ));
+
+    try std.testing.expectEqualStrings(
+        \\boo!
+        \\
+    , output.written());
 }
