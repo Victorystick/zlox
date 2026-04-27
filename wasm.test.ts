@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import init from "./zig-out/bin/zlox.wasm?init";
+import { instantiateNode } from "./zlox";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8");
@@ -7,45 +7,31 @@ const decoder = new TextDecoder("utf-8");
 test("print", async () => {
   let calls = 0;
 
-  const instance = await init({
-    js: {
-      jsPrint(ptr: number, len: number) {
-        console.log(++calls);
-        const bytes = new Uint8Array(instance.exports.memory.buffer, ptr, len);
-        console.log(decoder.decode(bytes));
-      },
+  const decoder = new TextDecoder();
+
+  const zlox = await instantiateNode({
+    stdout(bytes) {
+      console.log(++calls);
+      console.log(decoder.decode(bytes));
     },
   });
 
-  /** Decodes an error code into a human-readable string. */
-  function getErrorName(code: number): string {
-    const start = instance.exports.errorName(code);
-    const buffer = new Uint8Array(instance.exports.memory.buffer);
-    // Find the length by looking for the null terminator.
-    const bytes = buffer.slice(start, buffer.indexOf(0, start));
-    return decoder.decode(bytes);
-  }
-
   function interpret(source: string) {
-    const bytes = encoder.encode(source);
-    const ptr = instance.exports.alloc(bytes.length);
-    new Uint8Array(instance.exports.memory.buffer).set(bytes, ptr);
-    const err = instance.exports.interpret(ptr, bytes.length);
+    const err = zlox.interpret(source);
     if (err) {
-      console.log("Error", err, getErrorName(err));
+      console.log("Error", err, zlox.error(err));
     }
-    instance.exports.dealloc(ptr, bytes.length);
   }
 
   // No code has been executed yet, so bytes used should be 0.
-  expect(instance.exports.bytesUsed()).toBe(0);
+  expect(zlox.bytesUsed()).toBe(0);
 
   interpret('var a = "foo"; fun foo() { print a; } foo();');
-  const afterFirst = instance.exports.bytesUsed();
+  const afterFirst = zlox.bytesUsed();
   console.log("Bytes used:", afterFirst);
 
   interpret('print "a" + "b"; a = "bar"; foo();');
-  const afterSecond = instance.exports.bytesUsed();
+  const afterSecond = zlox.bytesUsed();
   console.log("Bytes used:", afterSecond);
 
   // More bytes should be in use after the second interpretation.
@@ -55,5 +41,5 @@ test("print", async () => {
 
   // The parse error should have caused the bytecode to be freed, so no
   // additional bytes should be used.
-  expect(instance.exports.bytesUsed()).toBe(afterSecond);
+  expect(zlox.bytesUsed()).toBe(afterSecond);
 });

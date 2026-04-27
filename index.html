@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>oseg.dev | zlox</title>
+    <style>
+      body {
+        font-family: monospace;
+        margin: 0;
+        padding: 1rem;
+      }
+
+      .contents {
+        background-color: #eee;
+        border-radius: 1rem;
+        padding: 1rem;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-width: 20vw;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        body {
+          background-color: #111;
+          color: #eee;
+        }
+
+        .contents {
+          background-color: #222;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main style="display: flex; flex-direction: column; align-items: center">
+      <h1>Zlox</h1>
+      <!-- Two panels; the REPL on the left and the output on the right. -->
+      <div style="display: flex; gap: 1rem; min-height: 80vh">
+        <div class="contents">
+          <h2>REPL</h2>
+          <pre><code></code></pre>
+          >
+          <input
+            type="text"
+            id="input"
+            autofocus
+            style="font-family: monospace"
+          />
+        </div>
+        <div class="contents">
+          <h2>Output (bytes used: <span id="output-count">0</span>)</h2>
+          <pre><code id="output"></code></pre>
+        </div>
+      </div>
+      <script type="module">
+        import { instantiate } from "./zlox";
+
+        const decoder = new TextDecoder();
+
+        const zlox = await instantiate({
+          stdout(bytes) {
+            const str = decoder.decode(bytes);
+            console.log(str);
+            document.getElementById("output").textContent += str;
+            document.getElementById("output-count").textContent =
+              zlox.bytesUsed();
+          },
+        });
+
+        document.getElementById("input").addEventListener("keydown", (e) => {
+          if (e.key !== "Enter") return;
+          const str = e.target.value;
+          e.target.value = "";
+
+          document.querySelector("code").textContent += `> ${str}\n`;
+
+          const res = zlox.interpret(str);
+
+          document.getElementById("output-count").textContent =
+            zlox.bytesUsed();
+
+          if (res) {
+            document.querySelector("code").textContent +=
+              `${zlox.error(res)}\n`;
+          }
+        });
+      </script>
+    </main>
+  </body>
+</html>
