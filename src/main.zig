@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
     defer vm.deinit();
 
     if (args.next()) |file| {
-        const buf = try std.Io.Dir.cwd().readFileAlloc(init.io, file, std.heap.page_allocator, .nothing);
+        const buf = try std.Io.Dir.cwd().readFileAlloc(init.io, file, std.heap.page_allocator, .unlimited);
         defer std.heap.page_allocator.free(buf);
 
         _ = vm.interpret(buf) catch |err| {
