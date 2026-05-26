@@ -691,7 +691,9 @@ pub const VM = struct {
     fn gc(vm: *VM) !void {
         if (vm.isCollecting) {
             // This can happen if GC is triggered during GC, for example by a native function. In that case, we just skip the nested GC call.
-            std.debug.print("-- GC already in progress\n", .{});
+            if (comptime debug.LogGC) {
+                std.debug.print("-- GC already in progress\n", .{});
+            }
             return;
         }
         vm.isCollecting = true;
@@ -982,7 +984,6 @@ pub const VM = struct {
                     constants[i] = chunk.constants[i];
                 },
             }
-            try vm.printStack(null);
         }
 
         // Pop the objects we pushed onto the stack to keep them alive during cloning.
@@ -998,7 +999,6 @@ pub const VM = struct {
     }
 
     fn cloneFn(vm: *VM, func: Function) !*Object {
-        try vm.printStack(null);
         // This copy is safe, as long as we replace the chunk and name with
         // empty values before any other memory allocation occurs. Otherwise,
         // we risk treating the constants of the function as ObjectNodes and
@@ -1007,14 +1007,12 @@ pub const VM = struct {
         const copy = &obj.function;
         copy.name = null;
         copy.chunk = Chunk{ .code = &[_]u8{}, .constants = &[_]Value{} };
-        try vm.printStack(null);
 
         copy.chunk = try vm.cloneChunk(&func.chunk);
         errdefer copy.chunk.deinit(vm.alloc);
         if (func.name) |name| {
             copy.name = try String.init(vm.alloc, name.chars);
         }
-        try vm.printStack(null);
         return obj;
     }
 
@@ -1875,7 +1873,7 @@ const Parser = struct {
         if (parser.panicMode) return;
         parser.panicMode = true;
 
-        if (debug.PrintErrors) {
+        if (comptime debug.PrintErrors) {
             std.debug.print("[line {d}] Error", .{token.line});
 
             switch (token.type) {
