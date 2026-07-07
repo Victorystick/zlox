@@ -11,24 +11,10 @@
         padding: 1rem;
       }
 
-      .contents {
-        background-color: #eee;
-        border-radius: 1rem;
-        padding: 1rem;
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        min-width: 20vw;
-      }
-
       @media (prefers-color-scheme: dark) {
         body {
           background-color: #111;
           color: #eee;
-        }
-
-        .contents {
-          background-color: #222;
         }
       }
     </style>
@@ -36,56 +22,89 @@
   <body>
     <main style="display: flex; flex-direction: column; align-items: center">
       <h1>Zlox</h1>
-      <!-- Two panels; the REPL on the left and the output on the right. -->
-      <div style="display: flex; gap: 1rem; min-height: 80vh">
-        <div class="contents">
-          <h2>REPL</h2>
-          <pre><code></code></pre>
-          >
-          <input
-            type="text"
-            id="input"
-            autofocus
-            style="font-family: monospace"
-          />
-        </div>
-        <div class="contents">
-          <h2>Output (bytes used: <span id="output-count">0</span>)</h2>
-          <pre><code id="output"></code></pre>
-        </div>
-      </div>
+      <h2>Bytes used: <span id="output-count">0</span></h2>
+      <div id="terminal" style="max-width: 800px; width: stretch"></div>
       <script type="module">
         import { instantiate } from "./zlox";
+        import { WTerm } from "@wterm/dom";
+        import "@wterm/dom/css";
+
+        const term = new WTerm(document.getElementById("terminal"), {
+          cursorBlink: true,
+          onData: handleInput,
+        });
+        await term.init();
+
+        term.write(`An online REPL for implementation of Lox in Zig!\r\n`);
 
         const decoder = new TextDecoder();
+
+        term.write("Loading zlox...");
 
         const zlox = await instantiate({
           stdout(bytes) {
             const str = decoder.decode(bytes);
             console.log(str);
-            document.getElementById("output").textContent += str;
+            term.write(str.replaceAll("\n", "\r\n"));
             document.getElementById("output-count").textContent =
               zlox.bytesUsed();
           },
         });
 
-        document.getElementById("input").addEventListener("keydown", (e) => {
-          if (e.key !== "Enter") return;
-          const str = e.target.value;
-          e.target.value = "";
+        term.write(" done!\n\n\r");
 
-          document.querySelector("code").textContent += `> ${str}\n`;
+        let currentLine = "";
+        let brackets = 0;
+        const PROMPT = "zlox > ";
 
-          const res = zlox.interpret(str);
+        term.write(PROMPT);
 
-          document.getElementById("output-count").textContent =
-            zlox.bytesUsed();
+        // Input processor state machine
+        function handleInput(data) {
+          for (let i = 0; i < data.length; i++) {
+            const char = data[i];
 
-          if (res) {
-            document.querySelector("code").textContent +=
-              `${zlox.error(res)}\n`;
+            // Don't eval while there are open brackets.
+            if (char === "{") brackets++;
+            if (char === "}") brackets--;
+
+            if (char === "\r" || char === "\n") {
+              // --- ENTER KEY ---
+              term.write("\r\n");
+
+              if (currentLine.trim().length > 0 && !brackets) {
+                try {
+                  const result = zlox.interpret(currentLine);
+                  if (result) {
+                    term.write(zlox.error(result) + "\r\n");
+                  }
+                } catch (error) {
+                  // Write out compilation or runtime errors in ANSI red
+                  term.write(
+                    `\x1b[31mError: ${error.message || error}\x1b[0m\r\n`,
+                  );
+                }
+              }
+
+              if (brackets) {
+                term.write("   ... ");
+              } else {
+                currentLine = "";
+                term.write(PROMPT);
+              }
+            } else if (char === "\x7f" || char === "\b") {
+              // --- BACKSPACE KEY ---
+              if (currentLine.length > 0) {
+                currentLine = currentLine.slice(0, -1);
+                term.write("\b \b"); // Move back, overwrite with space, move back again
+              }
+            } else {
+              // --- PRINTABLE CHARACTERS ---
+              currentLine += char;
+              term.write(char); // Manually echo character back onto the screen
+            }
           }
-        });
+        }
       </script>
     </main>
   </body>
