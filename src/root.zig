@@ -79,7 +79,7 @@ pub const Value = union(ValueType) {
         };
     }
 
-    fn asString(self: Value) ?String {
+    fn asString(self: Value) ?*String {
         return switch (self) {
             .obj => self.obj.asString(),
             else => null,
@@ -90,6 +90,27 @@ pub const Value = union(ValueType) {
         return switch (self) {
             .obj => switch (self.obj.*) {
                 .function => |*f| f,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    // Cool, but too cryptic.
+    // fn as(self: Value, comptime ty: ObjectType) ?*std.meta.fields(Object)[@intFromEnum(ty)].type {
+    //     return switch (self) {
+    //         .obj => switch (self.obj.*) {
+    //             ty => |*val| val,
+    //             else => null,
+    //         },
+    //         else => null,
+    //     };
+    // }
+
+    fn asInstance(self: Value) ?*Instance {
+        return switch (self) {
+            .obj => switch (self.obj.*) {
+                .instance => |*i| i,
                 else => null,
             },
             else => null,
@@ -215,6 +236,32 @@ const Closure = struct {
     }
 };
 
+const Class = struct {
+    // Unowned.
+    name: *String,
+
+    pub fn format(self: Class, writer: *std.Io.Writer) !void {
+        // Note: In the book, a class just prints its name.
+        try writer.print("<class {s}>", .{self.name.chars});
+    }
+};
+
+const Instance = struct {
+    // Unowned.
+    class: *Class,
+    fields: ValueMap = .empty,
+
+    pub fn deinit(self: *Instance, alloc: std.mem.Allocator) void {
+        self.fields.deinit(alloc);
+    }
+
+    pub fn format(self: Instance, writer: *std.Io.Writer) !void {
+        // Note: In the book, an instance prints the class name
+        // followed by " instance".
+        try writer.print("<instance {s}>", .{self.class.name.chars});
+    }
+};
+
 const NativeErr = error{
     OutOfMemory,
     RuntimeError,
@@ -237,6 +284,8 @@ const ObjectType = enum {
     native,
     closure,
     upvalue,
+    class,
+    instance,
 };
 const Object = union(ObjectType) {
     string: String,
@@ -244,29 +293,27 @@ const Object = union(ObjectType) {
     native: Native,
     closure: Closure,
     upvalue: Upvalue,
+    class: Class,
+    instance: Instance,
 
-    pub fn deinit(self: Object, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Object, alloc: std.mem.Allocator) void {
         if (comptime debug.LogGC) {
-            std.debug.print("  Free    {s: <10}: {f}\n", .{ switch (self) {
-                .string => "string",
-                .function => "function",
-                .native => "native",
-                .closure => "closure",
-                .upvalue => "upvalue",
-            }, self });
+            std.debug.print("  Free    {s: <10}: {f}\n", .{ @tagName(@as(ObjectType, self.*)), self });
         }
-        switch (self) {
+        switch (self.*) {
             .string => |string| string.deinit(alloc),
             .function => |function| function.deinit(alloc),
             .closure => |closure| closure.deinit(alloc),
+            .instance => |*instance| instance.deinit(alloc),
+            .class => {}, // |class| class.deinit(alloc),
             .upvalue => {},
             .native => {},
         }
     }
 
-    fn asString(self: *Object) ?String {
+    fn asString(self: *Object) ?*String {
         return switch (self.*) {
-            .string => |s| s,
+            .string => |*s| s,
             else => null,
         };
     }
@@ -283,6 +330,8 @@ const Object = union(ObjectType) {
             .native => |native| native.format(writer),
             .closure => |closure| closure.format(writer),
             .upvalue => writer.writeAll("<upvalue>"),
+            .class => |class| class.format(writer),
+            .instance => |instance| instance.format(writer),
         };
     }
 
@@ -322,6 +371,9 @@ const OpCode = enum(u8) {
     Loop,
     Call,
     Closure,
+    Class,
+    GetProperty,
+    SetProperty,
     _,
 };
 
@@ -397,6 +449,7 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
         .SetLocal => byteInstruction("SetLocal", chunk, offset, io),
         .GetUpvalue => byteInstruction("GetUpvalue", chunk, offset, io),
         .SetUpvalue => byteInstruction("SetUpvalue", chunk, offset, io),
+        .Class => byteInstruction("Class", chunk, offset, io),
         .CloseUpvalue => simpleInstruction("CloseUpvalue", offset, io),
         .Return => simpleInstruction("Return", offset, io),
         .Negate => simpleInstruction("Negate", offset, io),
@@ -452,6 +505,8 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
 
             return offset + 2;
         },
+        .GetProperty => byteInstruction("GetProperty", chunk, offset, io),
+        .SetProperty => byteInstruction("SetProperty", chunk, offset, io),
         _ => {
             try io.print("Unknown opcode {d}\n", .{chunk.code[offset]});
             return offset + 1;
@@ -593,6 +648,8 @@ fn StringMap(comptime V: type) type {
     return std.hash_map.HashMapUnmanaged(*const String, V, StringHashing, 80);
 }
 
+const ValueMap = StringMap(Value);
+
 // A call frame represents a single function invocation. It keeps track of the
 // function being called, where we are in that function's bytecode, and where
 // the function's local variables are on the stack.
@@ -650,7 +707,7 @@ pub const VM = struct {
 
     // Interned strings.
     strings: StringMap(*Object) = .empty,
-    globals: StringMap(Value) = .empty,
+    globals: ValueMap = .empty,
 
     // The head of a linked list of open upvalues.
     openUpvalues: ?*Upvalue = null,
@@ -720,13 +777,7 @@ pub const VM = struct {
 
         // The book says to also mark the strings, but I store them
         // differently. Let's see if this causes any issues.
-        var globals = vm.globals.iterator();
-        while (globals.next()) |entry| {
-            // The key_ptr points to the ObjectNode in the global map.
-            // It must be cast to *Object to use vm.mark
-            try vm.mark(@constCast(@fieldParentPtr("string", entry.key_ptr.*)));
-            try vm.markValue(entry.value_ptr);
-        }
+        try vm.markValueMap(&vm.globals);
 
         for (vm.frames[0..vm.frameCount]) |frame| {
             const o: *Object = @constCast(@fieldParentPtr("closure", frame.closure));
@@ -744,6 +795,16 @@ pub const VM = struct {
         // is closer connected to the VM than it is here.
     }
 
+    fn markValueMap(vm: *VM, map: *ValueMap) !void {
+        var iter = map.iterator();
+        while (iter.next()) |entry| {
+            // The key_ptr points to the ObjectNode in the global map.
+            // It must be cast to *Object to use vm.mark
+            try vm.mark(@constCast(@fieldParentPtr("string", entry.key_ptr.*)));
+            try vm.markValue(entry.value_ptr);
+        }
+    }
+
     fn markValue(vm: *VM, val: *Value) !void {
         switch (val.*) {
             .obj => |o| try vm.mark(o),
@@ -755,13 +816,7 @@ pub const VM = struct {
         const n: *ObjectNode = @fieldParentPtr("data", o);
         if (n.isMarked) return;
         if (comptime debug.LogGC) {
-            std.debug.print("  Marking {s: <10}: {f}\n", .{ switch (o.*) {
-                .string => "string",
-                .function => "function",
-                .native => "native",
-                .closure => "closure",
-                .upvalue => "upvalue",
-            }, o });
+            std.debug.print("  Marking {s: <10}: {f}\n", .{ @tagName(@as(ObjectType, o.*)), o });
         }
         n.isMarked = true;
         switch (o.*) {
@@ -793,30 +848,14 @@ pub const VM = struct {
                 .upvalue => |upvalue| {
                     try vm.markValue(upvalue.location);
                 },
+                .instance => |*i| {
+                    try vm.mark(@fieldParentPtr("class", i.class));
+                    try vm.markValueMap(&i.fields);
+                },
+                .class => {},
             }
         }
     }
-
-    // /// Removes unreachable (unmarked) strings from the intern map. The actual
-    // /// Objects contained within it are removed in sweep.
-    // fn removeUnreachableStrings(vm: *VM) !void {
-    //     var unused_keys: std.ArrayList(*const String) = .empty;
-    //     defer unused_keys.deinit(vm.alloc);
-
-    //     var strings = vm.strings.iterator();
-    //     while (strings.next()) |entry| {
-    //         const obj: *Object = entry.value_ptr.*;
-    //         const node: *ObjectNode = @fieldParentPtr("data", obj);
-    //         if (!node.isMarked) {
-    //             std.debug.print("  Removing unreachable string: {s}\n", .{entry.value_ptr.*.string.chars});
-    //             try unused_keys.append(vm.alloc, entry.key_ptr.*);
-    //         }
-    //     }
-
-    //     for (unused_keys.items) |key| {
-    //         _ = vm.strings.remove(key);
-    //     }
-    // }
 
     test "remove unreachable strings" {
         var disc: std.Io.Writer.Discarding = .init(&.{});
@@ -856,7 +895,7 @@ pub const VM = struct {
                     vm.objects = current;
                 }
 
-                if (node.data.asString()) |*string| {
+                if (node.data.asString()) |string| {
                     _ = vm.strings.remove(string);
                 }
                 node.data.deinit(vm.alloc);
@@ -884,13 +923,7 @@ pub const VM = struct {
     fn createObject(vm: *VM, data: Object) !*Object {
         const node = try vm.alloc.create(ObjectNode);
         if (comptime debug.LogGC) {
-            std.debug.print("  Alloc   {s: <10}: {f}\n", .{ switch (data) {
-                .string => "string",
-                .function => "function",
-                .native => "native",
-                .closure => "closure",
-                .upvalue => "upvalue",
-            }, data });
+            std.debug.print("  Free    {s: <10}: {f}\n", .{ @tagName(@as(ObjectType, data)), data });
         }
         node.* = ObjectNode{ .next = vm.objects, .data = data };
         vm.objects = node;
@@ -1045,7 +1078,7 @@ pub const VM = struct {
                     const constant = frame.constant();
 
                     if (constant.asString()) |str| {
-                        _ = try vm.intern(str);
+                        _ = try vm.intern(str.*);
                     } else {
                         vm.push(constant);
                     }
@@ -1053,7 +1086,7 @@ pub const VM = struct {
                 .DefineGlobal => {
                     const constant = frame.constant();
                     if (constant.asString()) |str| {
-                        const interned = try vm.intern(str);
+                        const interned = try vm.intern(str.*);
                         try vm.globals.put(vm.alloc, &interned.string, vm.peek(1));
                         _ = vm.pop();
                         _ = vm.pop();
@@ -1066,7 +1099,7 @@ pub const VM = struct {
                 .SetGlobal => {
                     const constant = frame.constant();
                     if (constant.asString()) |str| {
-                        if (vm.globals.getPtr(&str)) |ptr| {
+                        if (vm.globals.getPtr(str)) |ptr| {
                             ptr.* = vm.peek(0);
                         } else {
                             try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
@@ -1082,7 +1115,7 @@ pub const VM = struct {
                 .GetGlobal => {
                     const constant = frame.constant();
                     if (constant.asString()) |str| {
-                        if (vm.globals.get(&str)) |val| {
+                        if (vm.globals.get(str)) |val| {
                             vm.push(val);
                         } else {
                             try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
@@ -1204,6 +1237,11 @@ pub const VM = struct {
                                 vm.stackTop -= argCount + 1;
                                 vm.push(result);
                             },
+                            .class => |*class| {
+                                const obj = try vm.createObject(.{ .instance = .{ .class = class } });
+                                vm.stackTop -= argCount + 1;
+                                vm.push(.{ .obj = obj });
+                            },
                             else => {
                                 try vm.io.print("Can only call functions and classes!\n", .{});
                                 try vm.io.flush();
@@ -1257,12 +1295,88 @@ pub const VM = struct {
                         return .RuntimeError;
                     }
                 },
+                .Class => {
+                    const constant = frame.constant();
+
+                    if (constant.asString()) |str| {
+                        _ = try vm.pushObj(.{ .class = .{ .name = str } });
+                    } else {
+                        return error.RuntimeError;
+                    }
+                },
+                .GetProperty => {
+                    const instance = vm.peek(0).asInstance() orelse {
+                        try vm.io.print("Only instances have properties.\n", .{});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    const name = frame.constant().asString() orelse {
+                        try vm.io.print("Tried to access a non-string property!\n", .{});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    const value = instance.fields.get(name) orelse {
+                        try vm.io.print("Undefined property '{s}'.\n", .{name.chars});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    _ = vm.pop(); // instance
+                    vm.push(value);
+                },
+                .SetProperty => {
+                    const instance = vm.peek(1).asInstance() orelse {
+                        try vm.io.print("Only instances have properties.\n", .{});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    const name = frame.constant().asString() orelse {
+                        try vm.io.print("Tried to access a non-string property!\n", .{});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    try instance.fields.put(vm.alloc, name, vm.peek(0));
+                    const value = vm.pop();
+                    _ = vm.pop();
+                    vm.push(value);
+                },
             }
         }
 
         try vm.io.print("Missing a return to terminate the chunk!\n", .{});
         try vm.io.flush();
         return .RuntimeError;
+    }
+
+    test "class" {
+        try runs(&.{
+            \\class Brioche {}
+            \\print Brioche;
+        },
+            \\<class Brioche>
+            \\
+        );
+    }
+
+    test "instance" {
+        try runs(&.{
+            \\class Brioche {}
+            \\print Brioche();
+        },
+            \\<instance Brioche>
+            \\
+        );
+    }
+
+    test "properties" {
+        try runs(&.{
+            \\class Ref {}
+            \\var r = Ref();
+            \\r.value = 42;
+            \\print r.value;
+        },
+            \\42
+            \\
+        );
     }
 
     // Interns a string and returns the interned version. The returned string
@@ -1891,6 +2005,7 @@ const Parser = struct {
         return parser.current.type == typ;
     }
 
+    /// Checks for the given token type, and consumes it.
     fn match(parser: *Parser, typ: TokenType) bool {
         const res = parser.check(typ);
         if (res) parser.advance();
@@ -1924,6 +2039,19 @@ const Parser = struct {
         }
         parser.consume(.RightParen, "Expect ')' after arguments.");
         return argCount;
+    }
+
+    fn dot(parser: *Parser, canAssign: bool) !void {
+        parser.consume(.Identifier, "Expect property name after '.'.");
+        const name = try parser.identifierConstant(parser.previous);
+
+        if (canAssign and parser.match(.Equal)) {
+            try parser.expression();
+            try parser.writer.emitOp(.SetProperty);
+        } else {
+            try parser.writer.emitOp(.GetProperty);
+        }
+        try parser.writer.emit(name);
     }
 
     fn number(parser: *Parser, _: bool) !void {
@@ -2209,6 +2337,20 @@ const Parser = struct {
         try parser.defineVariable(global);
     }
 
+    fn classDeclaration(parser: *Parser) !void {
+        parser.consume(.Identifier, "Expect class name.");
+
+        const nameConstant = try parser.identifierConstant(parser.previous);
+        try parser.declareVariable();
+
+        try parser.compiler.writer.emitOp(.Class);
+        try parser.compiler.writer.emit(nameConstant);
+        try parser.defineVariable(nameConstant);
+
+        parser.consume(.LeftBrace, "Expect '{' before class body.");
+        parser.consume(.RightBrace, "Expect '}' after class body.");
+    }
+
     fn function(parser: *Parser, funTy: FunctionType) !void {
         var compiler = Compiler.init(parser.alloc, funTy);
         compiler.enclosing = parser.compiler;
@@ -2305,6 +2447,8 @@ const Parser = struct {
             try parser.varDeclaration();
         } else if (parser.match(.Fun)) {
             try parser.funDeclaration();
+        } else if (parser.match(.Class)) {
+            try parser.classDeclaration();
         } else {
             try parser.statement();
         }
@@ -2381,6 +2525,7 @@ const Parser = struct {
             .Identifier => Rule{ .prefix = variable },
             .Plus => Rule{ .prec = .Term, .infix = binary },
             .Minus => Rule{ .prec = .Term, .prefix = unary, .infix = binary },
+            .Dot => Rule{ .prec = .Call, .infix = dot },
             .Star => Rule{ .prec = .Factor, .infix = binary },
             .Slash => Rule{ .prec = .Factor, .infix = binary },
             .False => Rule{ .prefix = literal },
@@ -2481,6 +2626,24 @@ const gcVtable = struct {
         meta.alloc.vtable.free(meta.alloc.ptr, memory, alignment, ret_addr);
     }
 }.vtable;
+
+fn bytecode(source: []const u8, expected_bytecode: []const u8) !void {
+    const alloc = std.testing.allocator;
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+
+    const func = try parser.compile();
+    defer func.deinit(alloc);
+
+    var output = std.Io.Writer.Allocating.init(alloc);
+    defer output.deinit();
+    const output_writer = &output.writer;
+
+    try func.disassemble(output_writer);
+
+    try std.testing.expectEqualStrings(expected_bytecode, output.written());
+}
 
 fn run(source: []const u8, expected_output: []const u8) !void {
     return runs(&.{source}, expected_output);
@@ -2936,4 +3099,44 @@ test "persist functions" {
         \\boo!
         \\
     , output.written());
+}
+
+test "pair" {
+    try run(
+        \\class Pair {}
+        \\
+        \\var pair = Pair();
+        \\pair.first = 1;
+        \\pair.second = 2;
+        \\print pair.first + pair.second; // 3.
+    ,
+        \\3
+        \\
+    );
+}
+
+test "set and get property" {
+    try bytecode(
+        \\class A {}
+        \\var a = A();
+        \\a.foo = 1;
+        \\a.foo;
+    ,
+        \\== <script> ==
+        \\0000 Class          0
+        \\0002 DefineGlobal   0 A
+        \\0004 GetGlobal      0 A
+        \\0006 Call           0
+        \\0008 DefineGlobal   1 a
+        \\0010 GetGlobal      1 a
+        \\0012 Constant       3 1
+        \\0014 SetProperty    2
+        \\0016 Pop
+        \\0017 GetGlobal      1 a
+        \\0019 GetProperty    2
+        \\0021 Pop
+        \\0022 Nil
+        \\0023 Return
+        \\
+    );
 }
