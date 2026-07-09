@@ -6,7 +6,6 @@ const debug = .{
     .TraceExecution = false,
     // Must be false in Wasm since it relies on std.debug.print, which is not
     // available in that target.
-    .PrintErrors = false,
     .StressGC = false,
     .LogGC = false,
 };
@@ -374,6 +373,7 @@ const OpCode = enum(u8) {
     Class,
     GetProperty,
     SetProperty,
+    DelProperty,
     _,
 };
 
@@ -507,6 +507,7 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
         },
         .GetProperty => byteInstruction("GetProperty", chunk, offset, io),
         .SetProperty => byteInstruction("SetProperty", chunk, offset, io),
+        .DelProperty => byteInstruction("DelProperty", chunk, offset, io),
         _ => {
             try io.print("Unknown opcode {d}\n", .{chunk.code[offset]});
             return offset + 1;
@@ -572,7 +573,7 @@ pub const ChunkWriter = struct {
     }
 
     pub fn emitOp(self: *ChunkWriter, op: OpCode) !void {
-        try self.emit(@as(u8, @intFromEnum(op)));
+        try self.emit(@intFromEnum(op));
     }
 
     pub fn emitLoop(self: *ChunkWriter, offset: usize) !void {
@@ -667,7 +668,7 @@ const CallFrame = struct {
 
     /// Returns the next opcode.
     fn op(vm: *Self) OpCode {
-        return @as(OpCode, @enumFromInt(vm.byte()));
+        return @enumFromInt(vm.byte());
     }
 
     fn constant(vm: *Self) Value {
@@ -905,7 +906,8 @@ pub const VM = struct {
     }
 
     pub fn interpret(vm: *VM, source: []const u8) !Result {
-        var parser = try Parser.init(vm.alloc, source);
+        // TODO: Differentiate between stdout and stderr. This should be stderr.
+        var parser = try Parser.init(vm.alloc, vm.io, source);
         defer parser.deinit();
 
         const func = try parser.compile();
@@ -1339,6 +1341,19 @@ pub const VM = struct {
                     _ = vm.pop();
                     vm.push(value);
                 },
+                .DelProperty => {
+                    const instance = vm.peek(0).asInstance() orelse {
+                        try vm.io.print("Only instances have properties.\n", .{});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    const name = frame.constant().asString() orelse {
+                        try vm.io.print("Tried to access a non-string property!\n", .{});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    vm.push(.{ .bool = instance.fields.remove(name) });
+                },
             }
         }
 
@@ -1584,6 +1599,7 @@ const TokenType = enum {
     True,
     Var,
     While,
+    Del,
 
     Special, // Used internally for the parser.
     Error,
@@ -1593,6 +1609,7 @@ const TokenType = enum {
 const Token = struct {
     type: TokenType,
     source: []const u8,
+    start: usize,
     line: usize,
 };
 
@@ -1654,7 +1671,7 @@ const Scanner = struct {
     }
 
     fn errorToken(scanner: *const Scanner, text: []const u8) Token {
-        return Token{ .type = .Error, .source = text, .line = scanner.line };
+        return Token{ .type = .Error, .source = text, .start = scanner.start, .line = scanner.line };
     }
 
     fn match(scanner: *Scanner, expected: u8) bool {
@@ -1700,6 +1717,7 @@ const Scanner = struct {
         return switch (scanner.source[scanner.start]) {
             'a' => scanner.checkKeyword(1, "nd", .And),
             'c' => scanner.checkKeyword(1, "lass", .Class),
+            'd' => scanner.checkKeyword(1, "el", .Del),
             'e' => scanner.checkKeyword(1, "lse", .Else),
             'i' => scanner.checkKeyword(1, "f", .If),
             'n' => scanner.checkKeyword(1, "il", .Nil),
@@ -1770,8 +1788,30 @@ const Scanner = struct {
         return Token{
             .type = typ,
             .source = scanner.source[scanner.start..scanner.current],
+            .start = scanner.start,
             .line = scanner.line,
         };
+    }
+
+    const Range = struct {
+        start: usize,
+        end: usize,
+    };
+
+    fn lineRangeFor(scanner: *const Scanner, tok: Token) Range {
+        var start = tok.start;
+        var end = start + tok.source.len;
+        while (0 < start and scanner.source[start - 1] != '\n') start -= 1;
+        while (end < scanner.source.len and scanner.source[end] != '\n') end += 1;
+        return .{ .start = start, .end = end };
+    }
+
+    fn lineFor(scanner: *const Scanner, tok: Token) []const u8 {
+        var start = tok.start;
+        var end = start + tok.source.len;
+        while (0 < start and scanner.source[start - 1] != '\n') start -= 1;
+        while (end < scanner.source.len and scanner.source[end] != '\n') end += 1;
+        return scanner.source[start..end];
     }
 };
 
@@ -1810,7 +1850,7 @@ const Compiler = struct {
     fn init(alloc: std.mem.Allocator, typ: FunctionType) Compiler {
         var compiler = Compiler{ .writer = ChunkWriter.init(alloc, typ) };
         // The VM uses the first slot of the locals array internally, so we need to reserve it with a dummy value.
-        const token = Token{ .type = .Special, .source = "", .line = 0 };
+        const token = Token{ .type = .Special, .source = "", .start = 0, .line = 0 };
         compiler.locals[0] = Local{ .name = token, .depth = 0 };
         return compiler;
     }
@@ -1915,6 +1955,7 @@ const ParseError = error{
     InvalidCharacter,
     JumpTooLong,
     WriteFailed,
+    ParseError,
 };
 
 const Parser = struct {
@@ -1922,16 +1963,18 @@ const Parser = struct {
     scanner: Scanner,
     compiler: *Compiler,
     writer: *ChunkWriter,
+    err: *std.Io.Writer,
     current: Token = Token{
         .type = .Error,
         .source = "No parse\n",
+        .start = 0,
         .line = 0,
     },
     previous: Token = undefined,
     hadError: bool = false,
     panicMode: bool = false,
 
-    fn init(alloc: std.mem.Allocator, source: []const u8) !Parser {
+    fn init(alloc: std.mem.Allocator, err: *std.Io.Writer, source: []const u8) !Parser {
         const compiler = try alloc.create(Compiler);
         compiler.* = Compiler.init(alloc, .Script);
         return Parser{
@@ -1939,6 +1982,7 @@ const Parser = struct {
             .scanner = Scanner{ .source = source },
             .compiler = compiler,
             .writer = &compiler.writer,
+            .err = err,
         };
     }
 
@@ -1987,17 +2031,33 @@ const Parser = struct {
         if (parser.panicMode) return;
         parser.panicMode = true;
 
-        if (comptime debug.PrintErrors) {
-            std.debug.print("[line {d}] Error", .{token.line});
+        // TODO: Improve error handling.
+        parser.err.print("Error", .{}) catch {};
 
-            switch (token.type) {
-                .Eof => std.debug.print(" at end", .{}),
-                .Error => {},
-                else => std.debug.print(" at '{s}'", .{token.source}),
-            }
-
-            std.debug.print(": {s}\n", .{text});
+        switch (token.type) {
+            .Eof => parser.err.print(" at end", .{}) catch {},
+            .Error => {},
+            else => parser.err.print(" at '{s}'", .{token.source}) catch {},
         }
+
+        parser.err.print(": {s}\n", .{text}) catch {};
+
+        switch (token.type) {
+            .Error, .Special => {},
+            else => {
+                const range = parser.scanner.lineRangeFor(token);
+                parser.err.print("{d: >3}: {s}\n", .{ token.line, parser.scanner.source[range.start..range.end] }) catch {};
+
+                const indent = token.start - range.start + 5; // for the line number, colon and space.
+                for (0..indent) |_| {
+                    _ = parser.err.write(" ") catch {};
+                }
+                _ = parser.err.write("^\n") catch {};
+            },
+        }
+
+        parser.err.flush() catch {};
+
         parser.hadError = true;
     }
 
@@ -2052,6 +2112,18 @@ const Parser = struct {
             try parser.writer.emitOp(.GetProperty);
         }
         try parser.writer.emit(name);
+    }
+
+    fn del(parser: *Parser, _: bool) !void {
+        try parser.expression();
+
+        // The second last prop should be a get. Replace it with del.
+        if (parser.writer.code.items[parser.writer.code.items.len - 2] != @intFromEnum(OpCode.GetProperty)) {
+            parser.errorAt(parser.previous, "Requires a variable access!");
+            return error.ParseError;
+        } else {
+            parser.writer.code.items[parser.writer.code.items.len - 2] = @intFromEnum(OpCode.DelProperty);
+        }
     }
 
     fn number(parser: *Parser, _: bool) !void {
@@ -2532,6 +2604,7 @@ const Parser = struct {
             .True => Rule{ .prefix = literal },
             .Nil => Rule{ .prefix = literal },
             .Bang => Rule{ .prefix = unary },
+            .Del => Rule{ .prefix = del },
             .BangEqual => Rule{ .prec = .Equality, .infix = binary },
             .EqualEqual => Rule{ .prec = .Comparison, .infix = binary },
             .Greater => Rule{ .prec = .Comparison, .infix = binary },
@@ -2627,10 +2700,15 @@ const gcVtable = struct {
     }
 }.vtable;
 
+/// A function to test the bytecode output for an input string.
 fn bytecode(source: []const u8, expected_bytecode: []const u8) !void {
+    const stderr = std.Io.File.stderr();
+    var buf: [1024]u8 = undefined;
+    var writer = stderr.writer(std.testing.io, &buf);
+
     const alloc = std.testing.allocator;
 
-    var parser = try Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, &writer.interface, source);
     defer parser.deinit();
 
     const func = try parser.compile();
@@ -2643,6 +2721,24 @@ fn bytecode(source: []const u8, expected_bytecode: []const u8) !void {
     try func.disassemble(output_writer);
 
     try std.testing.expectEqualStrings(expected_bytecode, output.written());
+}
+
+/// A function to test the parse output for an input string.
+fn parse_error(source: []const u8, expected_error: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var output = std.Io.Writer.Allocating.init(alloc);
+    defer output.deinit();
+    const output_writer = &output.writer;
+
+    var parser = try Parser.init(alloc, output_writer, source);
+    defer parser.deinit();
+
+    const func = parser.compile() catch {
+        return std.testing.expectEqualStrings(expected_error, output.written());
+    };
+
+    std.debug.print("No parse error!", .{});
+    func.deinit(alloc);
 }
 
 fn run(source: []const u8, expected_output: []const u8) !void {
@@ -2856,6 +2952,14 @@ test "for loop" {
         \\0
         \\1
         \\2
+        \\
+    );
+    try parse_error(
+        \\for (var i = 0;
+    ,
+        \\Error at end: Expect expression.
+        \\  1: for (var i = 0;
+        \\                    ^
         \\
     );
 }
@@ -3137,6 +3241,45 @@ test "set and get property" {
         \\0021 Pop
         \\0022 Nil
         \\0023 Return
+        \\
+    );
+    try parse_error(
+        \\a.
+    ,
+        \\Error at end: Expect property name after '.'.
+        \\  1: a.
+        \\       ^
+        \\
+    );
+}
+
+test "del property" {
+    try bytecode(
+        \\del a.b;
+    ,
+        \\== <script> ==
+        \\0000 GetGlobal      0 a
+        \\0002 DelProperty    1
+        \\0004 Pop
+        \\0005 Nil
+        \\0006 Return
+        \\
+    );
+    try run(
+        \\class A {}
+        \\var a = A();
+        \\print del a.b;
+    ,
+        \\false
+        \\
+    );
+    try parse_error(
+        \\
+        \\del a();
+    ,
+        \\Error at ')': Requires a variable access!
+        \\  2: del a();
+        \\           ^
         \\
     );
 }
