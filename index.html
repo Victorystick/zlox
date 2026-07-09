@@ -46,10 +46,14 @@
             const str = decoder.decode(bytes);
             console.log(str);
             term.write(str.replaceAll("\n", "\r\n"));
-            document.getElementById("output-count").textContent =
-              zlox.bytesUsed();
+            updateBytesUsed();
           },
         });
+
+        function updateBytesUsed() {
+          document.getElementById("output-count").textContent =
+            zlox.bytesUsed();
+        }
 
         term.write(" done!\n\n\r");
 
@@ -84,6 +88,7 @@
                     `\x1b[31mError: ${error.message || error}\x1b[0m\r\n`,
                   );
                 }
+                updateBytesUsed();
               }
 
               if (brackets) {
