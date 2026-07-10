@@ -166,9 +166,17 @@ const StringHashing = struct {
 };
 
 const FunctionType = enum {
-    Function,
-    Method,
     Script,
+    Function,
+    Initializer,
+    Method,
+
+    fn isClassOnly(self: FunctionType) bool {
+        return switch (self) {
+            .Initializer, .Method => true,
+            else => false,
+        };
+    }
 };
 
 const Function = struct {
@@ -747,6 +755,9 @@ pub const VM = struct {
     grayStack: std.ArrayList(*ObjectNode) = .empty,
     isCollecting: bool = false,
 
+    // Unlike the book, we need not mark or free this.
+    const initString = String.unowned("init");
+
     const ObjectNode = struct {
         next: ?*ObjectNode,
         isMarked: bool = false,
@@ -1101,6 +1112,12 @@ pub const VM = struct {
         try io.flush();
     }
 
+    fn runtimeError(vm: *VM, comptime fmt: []const u8, args: anytype) error{ WriteFailed, RuntimeError } {
+        try vm.io.print(fmt, args);
+        try vm.io.flush();
+        return error.RuntimeError;
+    }
+
     fn runLoop(vm: *VM) !void {
         var frame = &vm.frames[vm.frameCount - 1];
 
@@ -1122,9 +1139,7 @@ pub const VM = struct {
                 .DefineGlobal => {
                     const constant = frame.constant();
                     const str = constant.as(String) orelse {
-                        try vm.io.print("Expected string, got {f}!\n", .{constant});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Expected string, got {f}!\n", .{constant});
                     };
                     const interned = try vm.intern(str.*);
                     try vm.globals.put(vm.alloc, &interned.string, vm.peek(1));
@@ -1134,28 +1149,20 @@ pub const VM = struct {
                 .SetGlobal => {
                     const constant = frame.constant();
                     const str = constant.as(String) orelse {
-                        try vm.io.print("Expected string, got {f}!\n", .{constant});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Expected string, got {f}!\n", .{constant});
                     };
                     const ptr = vm.globals.getPtr(str) orelse {
-                        try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Undefined variable '{s}'!\n", .{str.chars});
                     };
                     ptr.* = vm.peek(0);
                 },
                 .GetGlobal => {
                     const constant = frame.constant();
                     const str = constant.as(String) orelse {
-                        try vm.io.print("Expected string, got {f}!\n", .{constant});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Expected string, got {f}!\n", .{constant});
                     };
                     const val = vm.globals.get(str) orelse {
-                        try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Undefined variable '{s}'!\n", .{str.chars});
                     };
                     vm.push(val);
                 },
@@ -1206,9 +1213,7 @@ pub const VM = struct {
                     switch (val) {
                         .float => {},
                         else => {
-                            try vm.io.print("Expected float!\n", .{});
-                            try vm.io.flush();
-                            return error.RuntimeError;
+                            return vm.runtimeError("Expected float!\n", .{});
                         },
                     }
                     vm.push(Value{ .float = -val.float });
@@ -1220,9 +1225,7 @@ pub const VM = struct {
                     } else if (vm.peek(0).isString() and vm.peek(0).isString()) {
                         try vm.concatenate();
                     } else {
-                        try vm.io.print("Operands must be two numbers or two strings!\n", .{});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Operands must be two numbers or two strings!\n", .{});
                     }
                 },
                 .Subtract => try vm.binop(.Subtract),
@@ -1275,19 +1278,17 @@ pub const VM = struct {
                             },
                             .class => |*class| {
                                 const obj = try vm.createObject(.{ .instance = .{ .class = class } });
-                                vm.stackTop -= argCount + 1;
-                                vm.push(.{ .obj = obj });
+                                vm.stack[vm.stackTop - (argCount + 1)] = .{ .obj = obj };
+                                if (class.methods.get(&initString)) |initializer| {
+                                    frame = try vm.call(initializer.as(Closure) orelse unreachable, argCount);
+                                } else if (argCount != 0) {
+                                    return vm.runtimeError("Expected 0 arguments but got {d}\n", .{argCount});
+                                }
                             },
-                            else => {
-                                try vm.io.print("Can only call functions and classes!\n", .{});
-                                try vm.io.flush();
-                                return error.RuntimeError;
-                            },
+                            else => return vm.runtimeError("Can only call functions and classes!\n", .{}),
                         },
                         else => {
-                            try vm.io.print("Can only call functions and classes!\n", .{});
-                            try vm.io.flush();
-                            return error.RuntimeError;
+                            return vm.runtimeError("Can only call functions and classes!\n", .{});
                         },
                     }
                 },
@@ -1326,9 +1327,7 @@ pub const VM = struct {
                             }
                         }
                     } else {
-                        try vm.io.print("Expected function, got {f}!\n", .{constant});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Expected function, got {f}!\n", .{constant});
                     }
                 },
                 .Class => {
@@ -1342,29 +1341,21 @@ pub const VM = struct {
                 },
                 .Method => {
                     const name = frame.constant().asString() orelse {
-                        try vm.io.print("Only classes have methods.\n", .{});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Only classes have methods.\n", .{});
                     };
                     const method = vm.peek(0);
                     const class = vm.peek(1).as(Class) orelse {
-                        try vm.io.print("Only classes have methods.\n", .{});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Only classes have methods.\n", .{});
                     };
                     try class.methods.put(vm.alloc, name, method);
                     _ = vm.pop();
                 },
                 .GetProperty => {
                     const instance = vm.peek(0).asInstance() orelse {
-                        try vm.io.print("Only instances have properties.\n", .{});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Only instances have properties.\n", .{});
                     };
                     const name = frame.constant().asString() orelse {
-                        try vm.io.print("Tried to access a non-string property!\n", .{});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Tried to access a non-string property!\n", .{});
                     };
 
                     // First check for a field.
@@ -1380,21 +1371,15 @@ pub const VM = struct {
                         vm.swap(); // Swap the bound method below the instance.
                         _ = vm.pop();
                     } else {
-                        try vm.io.print("Undefined property '{s}'.\n", .{name.chars});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Undefined property '{s}'.\n", .{name.chars});
                     }
                 },
                 .SetProperty => {
                     const instance = vm.peek(1).asInstance() orelse {
-                        try vm.io.print("Only instances have properties.\n", .{});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Only instances have properties.\n", .{});
                     };
                     const name = frame.constant().asString() orelse {
-                        try vm.io.print("Tried to access a non-string property!\n", .{});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Tried to access a non-string property!\n", .{});
                     };
                     try instance.fields.put(vm.alloc, name, vm.peek(0));
                     const value = vm.pop();
@@ -1403,23 +1388,17 @@ pub const VM = struct {
                 },
                 .DelProperty => {
                     const instance = vm.peek(0).asInstance() orelse {
-                        try vm.io.print("Only instances have properties.\n", .{});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Only instances have properties.\n", .{});
                     };
                     const name = frame.constant().asString() orelse {
-                        try vm.io.print("Tried to access a non-string property!\n", .{});
-                        try vm.io.flush();
-                        return error.RuntimeError;
+                        return vm.runtimeError("Tried to access a non-string property!\n", .{});
                     };
                     vm.push(.{ .bool = instance.fields.remove(name) });
                 },
             }
         }
 
-        try vm.io.print("Missing a return to terminate the chunk!\n", .{});
-        try vm.io.flush();
-        return error.RuntimeError;
+        return vm.runtimeError("Missing a return to terminate the chunk!\n", .{});
     }
 
     test "class" {
@@ -1496,14 +1475,10 @@ pub const VM = struct {
     fn call(vm: *VM, callee: *const Closure, argCount: usize) !*CallFrame {
         const arity = callee.function.arity;
         if (argCount != arity) {
-            try vm.io.print("Expected {d} arguments but got {d}!\n", .{ arity, argCount });
-            try vm.io.flush();
-            return error.RuntimeError;
+            return vm.runtimeError("Expected {d} arguments but got {d}!\n", .{ arity, argCount });
         }
         if (vm.frameCount == vm.frames.len) {
-            try vm.io.print("Stack overflow!\n", .{});
-            try vm.io.flush();
-            return error.RuntimeError;
+            return vm.runtimeError("Stack overflow!\n", .{});
         }
         vm.frames[vm.frameCount] = CallFrame{
             .closure = callee,
@@ -1555,9 +1530,7 @@ pub const VM = struct {
 
     fn binop(vm: *VM, comptime code: OpCode) !void {
         if (!vm.peek(0).isNumber() or !vm.peek(1).isNumber()) {
-            try vm.io.print("Expected float!\n", .{});
-            try vm.io.flush();
-            return error.RuntimeError;
+            return vm.runtimeError("Expected float!\n", .{});
         }
         const b = vm.pop().float;
         const a = vm.pop().float;
@@ -1931,7 +1904,7 @@ const Compiler = struct {
         // The VM uses the first slot of the locals array internally, so we need to reserve it with a dummy value.
         const token = Token{ .type = .Special, .source = "", .start = 0, .line = 0 };
         var local = Local{ .name = token, .depth = 0 };
-        if (typ != .Function) { // Why not .Method?
+        if (typ.isClassOnly()) {
             local.name.source = "this";
         }
         compiler.locals[0] = local;
@@ -1940,8 +1913,8 @@ const Compiler = struct {
 
     fn withinClass(self: *const Self) bool {
         // The book defines an "enclosing class", but I don't see why we need one.
-        // It should be enough to see if we're in scope of a method.
-        if (self.writer.fnType == .Method) return true;
+        // It should be enough to see if we're in scope of a class-only fn type.
+        if (self.writer.fnType.isClassOnly()) return true;
         const parent = self.enclosing orelse return false;
         return parent.withinClass();
     }
@@ -2365,6 +2338,10 @@ const Parser = struct {
         if (parser.check(.Semicolon)) {
             try parser.emitReturn();
         } else {
+            if (parser.writer.fnType == .Initializer) {
+                parser.errorAt(parser.previous, "Can't return a value from an initializer.");
+                return;
+            }
             try parser.expression();
             parser.consume(.Semicolon, "Expect ';' after return value.");
             try parser.writer.emitOp(.Return);
@@ -2531,7 +2508,7 @@ const Parser = struct {
     fn method(parser: *Parser) !void {
         parser.consume(.Identifier, "Expect method name.");
         const constant = try parser.identifierConstant(parser.previous);
-        try parser.function(.Method);
+        try parser.function(if (std.mem.eql(u8, "init", parser.previous.source)) .Initializer else .Method);
 
         try parser.writer.emitOp(.Method);
         try parser.writer.emit(constant);
@@ -2601,7 +2578,12 @@ const Parser = struct {
     }
 
     fn emitReturn(parser: *Parser) !void {
-        try parser.writer.emitOp(.Nil);
+        if (parser.writer.fnType == .Initializer) {
+            try parser.writer.emitOp(.GetLocal);
+            try parser.writer.emit(0);
+        } else {
+            try parser.writer.emitOp(.Nil);
+        }
         try parser.writer.emitOp(.Return);
     }
 
@@ -3465,4 +3447,32 @@ test "reject out of scope this" {
         \\                         ^
         \\
     );
+}
+
+test "initializer" {
+    try run(
+        \\class Brunch { init(a, b) {} }
+        \\Brunch(1,2);
+    , "");
+}
+
+test "initializer bad return" {
+    try parse_error(
+        \\class Bad {
+        \\  init(a, b) {
+        \\    return 7;
+        \\ } }
+    ,
+        \\Error at 'return': Can't return a value from an initializer.
+        \\  3:     return 7;
+        \\         ^
+        \\
+    );
+}
+
+test "invoke" {
+    const code =
+        \\ class Thing { go() {} }
+        \\ Thing().go();
+    ;
 }
