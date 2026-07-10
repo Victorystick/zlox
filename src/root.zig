@@ -6,7 +6,7 @@ const debug = .{
     .TraceExecution = false,
     // Must be false in Wasm since it relies on std.debug.print, which is not
     // available in that target.
-    .StressGC = true,
+    .StressGC = false,
     .LogGC = false,
 };
 
@@ -167,6 +167,7 @@ const StringHashing = struct {
 
 const FunctionType = enum {
     Function,
+    Method,
     Script,
 };
 
@@ -186,7 +187,7 @@ const Function = struct {
 
     pub fn format(self: Function, writer: *std.Io.Writer) !void {
         if (self.name) |name| {
-            try writer.print("<fn {s}/{d}>", .{ name.chars, self.arity });
+            try writer.print("<fun {s}/{d}>", .{ name.chars, self.arity });
         } else {
             try writer.writeAll("<script>");
         }
@@ -213,6 +214,10 @@ const Upvalue = struct {
     closed: Value = .nil,
     // Unowned.
     next: ?*Upvalue = null,
+
+    pub fn format(self: Upvalue, writer: *std.Io.Writer) !void {
+        return writer.print("<upvalue {f}>", .{self.location.*});
+    }
 };
 
 const Closure = struct {
@@ -233,6 +238,7 @@ const Closure = struct {
     }
 
     pub fn format(self: Closure, writer: *std.Io.Writer) !void {
+        // Wouldn't it be nice to distinguish between closures and functions?
         return self.function.format(writer);
     }
 };
@@ -268,6 +274,17 @@ const Instance = struct {
     }
 };
 
+const BoundMethod = struct {
+    receiver: Value,
+    method: *Closure,
+
+    pub fn deinit(_: *BoundMethod, _: std.mem.Allocator) void {}
+
+    pub fn format(self: BoundMethod, writer: *std.Io.Writer) !void {
+        try self.method.format(writer);
+    }
+};
+
 const NativeErr = error{
     OutOfMemory,
     RuntimeError,
@@ -292,6 +309,7 @@ const ObjectType = enum {
     upvalue,
     class,
     instance,
+    boundMethod,
 };
 const Object = union(ObjectType) {
     string: String,
@@ -301,6 +319,7 @@ const Object = union(ObjectType) {
     upvalue: Upvalue,
     class: Class,
     instance: Instance,
+    boundMethod: BoundMethod,
 
     pub fn deinit(self: *Object, alloc: std.mem.Allocator) void {
         if (comptime debug.LogGC) {
@@ -312,6 +331,7 @@ const Object = union(ObjectType) {
             .closure => |closure| closure.deinit(alloc),
             .instance => |*instance| instance.deinit(alloc),
             .class => |*class| class.deinit(alloc),
+            .boundMethod => |*m| m.deinit(alloc),
             .upvalue => {},
             .native => {},
         }
@@ -347,9 +367,10 @@ const Object = union(ObjectType) {
             .function => |function| function.format(writer),
             .native => |native| native.format(writer),
             .closure => |closure| closure.format(writer),
-            .upvalue => writer.writeAll("<upvalue>"),
+            .upvalue => |up| up.format(writer),
             .class => |class| class.format(writer),
             .instance => |instance| instance.format(writer),
+            .boundMethod => |m| m.format(writer),
         };
     }
 
@@ -862,6 +883,11 @@ pub const VM = struct {
                 .class => |*c| {
                     try vm.markValueMap(&c.methods);
                 },
+                .boundMethod => |*m| {
+                    std.debug.print("DEBUG:: Marking receiver {f}\n", .{m.receiver});
+                    try vm.markValue(&m.receiver);
+                    try vm.mark(@fieldParentPtr("closure", m.method));
+                },
             }
         }
     }
@@ -933,7 +959,7 @@ pub const VM = struct {
     fn createObject(vm: *VM, data: Object) !*Object {
         const node = try vm.alloc.create(ObjectNode);
         if (comptime debug.LogGC) {
-            std.debug.print("  Free    {s: <10}: {f}\n", .{ @tagName(@as(ObjectType, data)), data });
+            std.debug.print("  Create  {s: <10}: {f}\n", .{ @tagName(@as(ObjectType, data)), data });
         }
         node.* = ObjectNode{ .next = vm.objects, .data = data };
         vm.objects = node;
@@ -1242,6 +1268,11 @@ pub const VM = struct {
                                 vm.stackTop -= argCount + 1;
                                 vm.push(result);
                             },
+                            .boundMethod => |*bound| {
+                                //
+                                vm.stack[vm.stackTop - (argCount + 1)] = bound.receiver;
+                                frame = try vm.call(bound.method, argCount);
+                            },
                             .class => |*class| {
                                 const obj = try vm.createObject(.{ .instance = .{ .class = class } });
                                 vm.stackTop -= argCount + 1;
@@ -1335,13 +1366,24 @@ pub const VM = struct {
                         try vm.io.flush();
                         return error.RuntimeError;
                     };
-                    const value = instance.fields.get(name) orelse {
+
+                    // First check for a field.
+                    if (instance.fields.get(name)) |value| {
+                        _ = vm.pop(); // instance
+                        vm.push(value);
+                    } else if (instance.class.methods.get(name)) |method| {
+                        // Keep a ref to the instance through the bound method.
+                        _ = try vm.pushObj(.{ .boundMethod = .{
+                            .method = method.as(Closure) orelse unreachable,
+                            .receiver = vm.peek(0),
+                        } });
+                        vm.swap(); // Swap the bound method below the instance.
+                        _ = vm.pop();
+                    } else {
                         try vm.io.print("Undefined property '{s}'.\n", .{name.chars});
                         try vm.io.flush();
                         return error.RuntimeError;
-                    };
-                    _ = vm.pop(); // instance
-                    vm.push(value);
+                    }
                 },
                 .SetProperty => {
                     const instance = vm.peek(1).asInstance() orelse {
@@ -1390,7 +1432,7 @@ pub const VM = struct {
             \\0000 Class          0 Car
             \\0002 DefineGlobal   0 Car
             \\0004 GetGlobal      0 Car
-            \\0006 Closure        2 <fn drive/0>
+            \\0006 Closure        2 <fun drive/0>
             \\0008 Method         1 drive
             \\0010 Pop
             \\0011 Nil
@@ -1888,8 +1930,20 @@ const Compiler = struct {
         var compiler = Compiler{ .writer = ChunkWriter.init(alloc, typ) };
         // The VM uses the first slot of the locals array internally, so we need to reserve it with a dummy value.
         const token = Token{ .type = .Special, .source = "", .start = 0, .line = 0 };
-        compiler.locals[0] = Local{ .name = token, .depth = 0 };
+        var local = Local{ .name = token, .depth = 0 };
+        if (typ != .Function) { // Why not .Method?
+            local.name.source = "this";
+        }
+        compiler.locals[0] = local;
         return compiler;
+    }
+
+    fn withinClass(self: *const Self) bool {
+        // The book defines an "enclosing class", but I don't see why we need one.
+        // It should be enough to see if we're in scope of a method.
+        if (self.writer.fnType == .Method) return true;
+        const parent = self.enclosing orelse return false;
+        return parent.withinClass();
     }
 
     fn deinit(self: *Self) void {
@@ -2201,6 +2255,14 @@ const Parser = struct {
         }
     }
 
+    fn this(parser: *Parser, _: bool) !void {
+        if (!parser.compiler.withinClass()) {
+            parser.errorAt(parser.previous, "Can't use 'this' outside of a class.");
+            return;
+        }
+        try parser.variable(false);
+    }
+
     fn grouping(parser: *Parser, _: bool) !void {
         try parser.expression();
         parser.consume(.RightParen, "Expect ')' after expression.");
@@ -2469,7 +2531,7 @@ const Parser = struct {
     fn method(parser: *Parser) !void {
         parser.consume(.Identifier, "Expect method name.");
         const constant = try parser.identifierConstant(parser.previous);
-        try parser.function(.Function);
+        try parser.function(.Method);
 
         try parser.writer.emitOp(.Method);
         try parser.writer.emit(constant);
@@ -2654,6 +2716,7 @@ const Parser = struct {
             .Slash => Rule{ .prec = .Factor, .infix = binary },
             .False => Rule{ .prefix = literal },
             .True => Rule{ .prefix = literal },
+            .This => Rule{ .prefix = this },
             .Nil => Rule{ .prefix = literal },
             .Bang => Rule{ .prefix = unary },
             .Del => Rule{ .prefix = del },
@@ -2789,7 +2852,7 @@ fn parse_error(source: []const u8, expected_error: []const u8) !void {
         return std.testing.expectEqualStrings(expected_error, output.written());
     };
 
-    std.debug.print("No parse error!", .{});
+    std.debug.print("No parse error!\n", .{});
     func.deinit(alloc);
 }
 
@@ -3023,7 +3086,7 @@ test "function" {
         \\}
         \\print noop;
     ,
-        \\<fn noop/7>
+        \\<fun noop/7>
         \\
     );
 }
@@ -3334,6 +3397,72 @@ test "del property" {
         \\Error at ')': Requires a variable access!
         \\  2: del a();
         \\           ^
+        \\
+    );
+}
+
+test "call method without receiver" {
+    const code =
+        \\class Scone {
+        \\  topping(first, second) {
+        \\    print "scone with " + first + " and " + second;
+        \\  }
+        \\}
+        \\var scone = Scone();
+        \\scone.topping("berries", "cream");
+    ;
+    try run(code, "scone with berries and cream\n");
+    try bytecode(code,
+        \\== <script> ==
+        \\0000 Class          0 Scone
+        \\0002 DefineGlobal   0 Scone
+        \\0004 GetGlobal      0 Scone
+        \\0006 Closure        2 <fun topping/2>
+        \\0008 Method         1 topping
+        \\0010 Pop
+        \\0011 GetGlobal      0 Scone
+        \\0013 Call           0
+        \\0015 DefineGlobal   3 scone
+        \\0017 GetGlobal      3 scone
+        \\0019 GetProperty    1 topping
+        \\0021 Constant       4 berries
+        \\0023 Constant       5 cream
+        \\0025 Call           2
+        \\0027 Pop
+        \\0028 Nil
+        \\0029 Return
+        \\
+    );
+}
+
+test "call method with nested function" {
+    const code =
+        \\class Nested {
+        \\    method() {
+        \\      fun function() {
+        \\        print this;
+        \\      }
+        \\
+        \\      return function;
+        \\    }
+        \\  }
+        \\
+        \\  Nested().method()();
+    ;
+    try run(code, "<instance Nested>\n");
+}
+
+test "reject out of scope this" {
+    try parse_error("this;",
+        \\Error at 'this': Can't use 'this' outside of a class.
+        \\  1: this;
+        \\     ^
+        \\
+    );
+    try parse_error("fun self() { return this; }",
+        \\Error at 'this': Can't use 'this' outside of a class.
+        \\  1: fun self() { return this; }
+        \\                         ^
         \\
     );
 }
