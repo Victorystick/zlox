@@ -732,8 +732,6 @@ pub const VM = struct {
         data: Object,
     };
 
-    const Result = enum { OK, RuntimeError };
-
     pub fn init(alloc: std.mem.Allocator, io: *std.Io.Writer, stack: []Value) VM {
         return VM{
             .alloc = alloc,
@@ -915,7 +913,7 @@ pub const VM = struct {
         }
     }
 
-    pub fn interpret(vm: *VM, source: []const u8) !Result {
+    pub fn interpret(vm: *VM, source: []const u8) !void {
         // TODO: Differentiate between stdout and stderr. This should be stderr.
         var parser = try Parser.init(vm.alloc, vm.io, source);
         defer parser.deinit();
@@ -955,7 +953,7 @@ pub const VM = struct {
     }
 
     // Takes ownership of the function.
-    fn run(vm: *VM, func: Function) !Result {
+    fn run(vm: *VM, func: Function) !void {
         // Implicit assumtion: The function has arity 0.
         const fnObj = try blk: {
             defer func.deinit(vm.alloc);
@@ -1077,7 +1075,7 @@ pub const VM = struct {
         try io.flush();
     }
 
-    fn runLoop(vm: *VM) !Result {
+    fn runLoop(vm: *VM) !void {
         var frame = &vm.frames[vm.frameCount - 1];
 
         while (frame.runnable()) {
@@ -1117,7 +1115,7 @@ pub const VM = struct {
                     const ptr = vm.globals.getPtr(str) orelse {
                         try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
                         try vm.io.flush();
-                        return .RuntimeError;
+                        return error.RuntimeError;
                     };
                     ptr.* = vm.peek(0);
                 },
@@ -1131,7 +1129,7 @@ pub const VM = struct {
                     const val = vm.globals.get(str) orelse {
                         try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
                         try vm.io.flush();
-                        return .RuntimeError;
+                        return error.RuntimeError;
                     };
                     vm.push(val);
                 },
@@ -1171,7 +1169,7 @@ pub const VM = struct {
                         if (comptime debug.TraceExecution) {
                             try vm.printStack(null);
                         }
-                        return .OK;
+                        return;
                     }
                     vm.stackTop = frame.slots.ptr - vm.stack.ptr;
                     vm.push(result);
@@ -1184,7 +1182,7 @@ pub const VM = struct {
                         else => {
                             try vm.io.print("Expected float!\n", .{});
                             try vm.io.flush();
-                            return .RuntimeError;
+                            return error.RuntimeError;
                         },
                     }
                     vm.push(Value{ .float = -val.float });
@@ -1213,7 +1211,7 @@ pub const VM = struct {
                 .Less => try vm.binop(.Less),
                 _ => {
                     try vm.io.flush();
-                    return .RuntimeError;
+                    return error.RuntimeError;
                 },
                 .Print => try vm.io.print("{f}\n", .{vm.pop()}),
                 .Pop => _ = vm.pop(),
@@ -1258,7 +1256,7 @@ pub const VM = struct {
                         else => {
                             try vm.io.print("Can only call functions and classes!\n", .{});
                             try vm.io.flush();
-                            return .RuntimeError;
+                            return error.RuntimeError;
                         },
                     }
                 },
@@ -1299,7 +1297,7 @@ pub const VM = struct {
                     } else {
                         try vm.io.print("Expected function, got {f}!\n", .{constant});
                         try vm.io.flush();
-                        return .RuntimeError;
+                        return error.RuntimeError;
                     }
                 },
                 .Class => {
@@ -1379,7 +1377,7 @@ pub const VM = struct {
 
         try vm.io.print("Missing a return to terminate the chunk!\n", .{});
         try vm.io.flush();
-        return .RuntimeError;
+        return error.RuntimeError;
     }
 
     test "class" {
@@ -2869,7 +2867,7 @@ fn runs(source: []const []const u8, expected_output: []const u8) !void {
     }
 
     for (source) |src| {
-        try std.testing.expectEqual(.OK, vm.interpret(src));
+        _ = try vm.interpret(src);
 
         // Force a GC pass to run, so we can catch any issues with it.
         try vm.gc();
@@ -3070,12 +3068,12 @@ test "native" {
 
     try vm.defineNative("frameDepth", frameDepth);
 
-    try std.testing.expectEqual(.OK, vm.interpret(
+    _ = try vm.interpret(
         \\fun wrapper() {
         \\  print frameDepth();
         \\}
         \\wrapper();
-    ));
+    );
 
     try std.testing.expectEqualStrings(
         \\2
@@ -3241,17 +3239,17 @@ test "persist functions" {
     var vm = VM.init(alloc, output_writer, &stack);
     defer vm.deinit();
 
-    try std.testing.expectEqual(.OK, vm.interpret(
+    _ = try vm.interpret(
         \\fun spooky() {
         \\  print "boo!";
         \\}
-    ));
+    );
 
     vm.gc() catch {};
 
-    try std.testing.expectEqual(.OK, vm.interpret(
+    _ = try vm.interpret(
         \\spooky();
-    ));
+    );
 
     try std.testing.expectEqualStrings(
         \\boo!
