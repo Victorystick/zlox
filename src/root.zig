@@ -6,7 +6,7 @@ const debug = .{
     .TraceExecution = false,
     // Must be false in Wasm since it relies on std.debug.print, which is not
     // available in that target.
-    .StressGC = false,
+    .StressGC = true,
     .LogGC = false,
 };
 
@@ -95,16 +95,18 @@ pub const Value = union(ValueType) {
         };
     }
 
-    // Cool, but too cryptic.
-    // fn as(self: Value, comptime ty: ObjectType) ?*std.meta.fields(Object)[@intFromEnum(ty)].type {
-    //     return switch (self) {
-    //         .obj => switch (self.obj.*) {
-    //             ty => |*val| val,
-    //             else => null,
-    //         },
-    //         else => null,
-    //     };
-    // }
+    /// Returns the value as `ty`, or null.
+    fn as(self: Value, comptime ty: type) ?*ty {
+        return switch (self) {
+            .obj => |obj| obj.as(ty),
+            inline else => |*val| {
+                if (comptime @TypeOf(val.*) == ty) {
+                    return val;
+                }
+                return null;
+            },
+        };
+    }
 
     fn asInstance(self: Value) ?*Instance {
         return switch (self) {
@@ -238,6 +240,11 @@ const Closure = struct {
 const Class = struct {
     // Unowned.
     name: *String,
+    methods: ValueMap = .empty,
+
+    pub fn deinit(self: *Class, alloc: std.mem.Allocator) void {
+        self.methods.deinit(alloc);
+    }
 
     pub fn format(self: Class, writer: *std.Io.Writer) !void {
         // Note: In the book, a class just prints its name.
@@ -304,10 +311,22 @@ const Object = union(ObjectType) {
             .function => |function| function.deinit(alloc),
             .closure => |closure| closure.deinit(alloc),
             .instance => |*instance| instance.deinit(alloc),
-            .class => {}, // |class| class.deinit(alloc),
+            .class => |*class| class.deinit(alloc),
             .upvalue => {},
             .native => {},
         }
+    }
+
+    /// Returns a pointer to the object's internal `ty` type, or null.
+    fn as(self: *Object, comptime ty: type) ?*ty {
+        switch (self.*) {
+            inline else => |*val| {
+                if (comptime @TypeOf(val.*) == ty) {
+                    return val;
+                }
+            },
+        }
+        return null;
     }
 
     fn asString(self: *Object) ?*String {
@@ -371,6 +390,7 @@ const OpCode = enum(u8) {
     Call,
     Closure,
     Class,
+    Method,
     GetProperty,
     SetProperty,
     DelProperty,
@@ -421,35 +441,16 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
     try io.print("{d:0>4} ", .{offset});
 
     return switch (@as(OpCode, @enumFromInt(chunk.code[offset]))) {
-        .Constant => {
-            const index = chunk.code[offset + 1];
-            const constant = chunk.constants[index];
-            try io.print("{s} {d: >3} {f}\n", .{ "Constant    ", index, constant });
-            return offset + 2;
-        },
-        .DefineGlobal => {
-            const index = chunk.code[offset + 1];
-            const constant = chunk.constants[index];
-            try io.print("{s} {d: >3} {f}\n", .{ "DefineGlobal", index, constant });
-            return offset + 2;
-        },
-        .GetGlobal => {
-            const index = chunk.code[offset + 1];
-            const constant = chunk.constants[index];
-            try io.print("{s} {d: >3} {f}\n", .{ "GetGlobal   ", index, constant });
-            return offset + 2;
-        },
-        .SetGlobal => {
-            const index = chunk.code[offset + 1];
-            const constant = chunk.constants[index];
-            try io.print("{s} {d: >3} {f}\n", .{ "SetGlobal   ", index, constant });
-            return offset + 2;
-        },
+        .Constant => constantInstruction("Constant", chunk, offset, io),
+        .DefineGlobal => constantInstruction("DefineGlobal", chunk, offset, io),
+        .GetGlobal => constantInstruction("GetGlobal", chunk, offset, io),
+        .SetGlobal => constantInstruction("SetGlobal", chunk, offset, io),
         .GetLocal => byteInstruction("GetLocal", chunk, offset, io),
         .SetLocal => byteInstruction("SetLocal", chunk, offset, io),
         .GetUpvalue => byteInstruction("GetUpvalue", chunk, offset, io),
         .SetUpvalue => byteInstruction("SetUpvalue", chunk, offset, io),
-        .Class => byteInstruction("Class", chunk, offset, io),
+        .Class => constantInstruction("Class", chunk, offset, io),
+        .Method => constantInstruction("Method", chunk, offset, io),
         .CloseUpvalue => simpleInstruction("CloseUpvalue", offset, io),
         .Return => simpleInstruction("Return", offset, io),
         .Negate => simpleInstruction("Negate", offset, io),
@@ -505,9 +506,9 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
 
             return offset + 2;
         },
-        .GetProperty => byteInstruction("GetProperty", chunk, offset, io),
-        .SetProperty => byteInstruction("SetProperty", chunk, offset, io),
-        .DelProperty => byteInstruction("DelProperty", chunk, offset, io),
+        .GetProperty => constantInstruction("GetProperty", chunk, offset, io),
+        .SetProperty => constantInstruction("SetProperty", chunk, offset, io),
+        .DelProperty => constantInstruction("DelProperty", chunk, offset, io),
         _ => {
             try io.print("Unknown opcode {d}\n", .{chunk.code[offset]});
             return offset + 1;
@@ -523,6 +524,13 @@ fn simpleInstruction(name: []const u8, offset: usize, io: *std.Io.Writer) !usize
 fn byteInstruction(name: []const u8, chunk: *const Chunk, offset: usize, io: *std.Io.Writer) !usize {
     const index = chunk.code[offset + 1];
     try io.print("{s: <12} {d: >3}\n", .{ name, index });
+    return offset + 2;
+}
+
+fn constantInstruction(name: []const u8, chunk: *const Chunk, offset: usize, io: *std.Io.Writer) !usize {
+    const index = chunk.code[offset + 1];
+    const constant = chunk.constants[index];
+    try io.print("{s: <12} {d: >3} {f}\n", .{ name, index, constant });
     return offset + 2;
 }
 
@@ -853,7 +861,9 @@ pub const VM = struct {
                     try vm.mark(@fieldParentPtr("class", i.class));
                     try vm.markValueMap(&i.fields);
                 },
-                .class => {},
+                .class => |*c| {
+                    try vm.markValueMap(&c.methods);
+                },
             }
         }
     }
@@ -1087,48 +1097,43 @@ pub const VM = struct {
                 },
                 .DefineGlobal => {
                     const constant = frame.constant();
-                    if (constant.asString()) |str| {
-                        const interned = try vm.intern(str.*);
-                        try vm.globals.put(vm.alloc, &interned.string, vm.peek(1));
-                        _ = vm.pop();
-                        _ = vm.pop();
-                    } else {
+                    const str = constant.as(String) orelse {
                         try vm.io.print("Expected string, got {f}!\n", .{constant});
                         try vm.io.flush();
-                        return .RuntimeError;
-                    }
+                        return error.RuntimeError;
+                    };
+                    const interned = try vm.intern(str.*);
+                    try vm.globals.put(vm.alloc, &interned.string, vm.peek(1));
+                    _ = vm.pop();
+                    _ = vm.pop();
                 },
                 .SetGlobal => {
                     const constant = frame.constant();
-                    if (constant.asString()) |str| {
-                        if (vm.globals.getPtr(str)) |ptr| {
-                            ptr.* = vm.peek(0);
-                        } else {
-                            try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
-                            try vm.io.flush();
-                            return .RuntimeError;
-                        }
-                    } else {
+                    const str = constant.as(String) orelse {
                         try vm.io.print("Expected string, got {f}!\n", .{constant});
                         try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    const ptr = vm.globals.getPtr(str) orelse {
+                        try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
+                        try vm.io.flush();
                         return .RuntimeError;
-                    }
+                    };
+                    ptr.* = vm.peek(0);
                 },
                 .GetGlobal => {
                     const constant = frame.constant();
-                    if (constant.asString()) |str| {
-                        if (vm.globals.get(str)) |val| {
-                            vm.push(val);
-                        } else {
-                            try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
-                            try vm.io.flush();
-                            return .RuntimeError;
-                        }
-                    } else {
+                    const str = constant.as(String) orelse {
                         try vm.io.print("Expected string, got {f}!\n", .{constant});
                         try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    const val = vm.globals.get(str) orelse {
+                        try vm.io.print("Undefined variable '{s}'!\n", .{str.chars});
+                        try vm.io.flush();
                         return .RuntimeError;
-                    }
+                    };
+                    vm.push(val);
                 },
                 .SetLocal => {
                     frame.slot().* = vm.peek(0);
@@ -1306,6 +1311,21 @@ pub const VM = struct {
                         return error.RuntimeError;
                     }
                 },
+                .Method => {
+                    const name = frame.constant().asString() orelse {
+                        try vm.io.print("Only classes have methods.\n", .{});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    const method = vm.peek(0);
+                    const class = vm.peek(1).as(Class) orelse {
+                        try vm.io.print("Only classes have methods.\n", .{});
+                        try vm.io.flush();
+                        return error.RuntimeError;
+                    };
+                    try class.methods.put(vm.alloc, name, method);
+                    _ = vm.pop();
+                },
                 .GetProperty => {
                     const instance = vm.peek(0).asInstance() orelse {
                         try vm.io.print("Only instances have properties.\n", .{});
@@ -1363,11 +1383,30 @@ pub const VM = struct {
     }
 
     test "class" {
+        try bytecode(
+            \\class Car {
+            \\  drive() {}
+            \\}
+        ,
+            \\== <script> ==
+            \\0000 Class          0 Car
+            \\0002 DefineGlobal   0 Car
+            \\0004 GetGlobal      0 Car
+            \\0006 Closure        2 <fn drive/0>
+            \\0008 Method         1 drive
+            \\0010 Pop
+            \\0011 Nil
+            \\0012 Return
+            \\
+        );
         try runs(&.{
-            \\class Brioche {}
-            \\print Brioche;
+            \\class Brunch {
+            \\  bacon() {}
+            \\  eggs() {}
+            \\}
+            \\print Brunch;
         },
-            \\<class Brioche>
+            \\<class Brunch>
             \\
         );
     }
@@ -2411,16 +2450,31 @@ const Parser = struct {
 
     fn classDeclaration(parser: *Parser) !void {
         parser.consume(.Identifier, "Expect class name.");
+        const className = parser.previous;
 
-        const nameConstant = try parser.identifierConstant(parser.previous);
+        const nameConstant = try parser.identifierConstant(className);
         try parser.declareVariable();
 
         try parser.compiler.writer.emitOp(.Class);
         try parser.compiler.writer.emit(nameConstant);
         try parser.defineVariable(nameConstant);
 
+        try parser.namedVariable(className, false);
         parser.consume(.LeftBrace, "Expect '{' before class body.");
+        while (!parser.check(.RightBrace) and !parser.check(.Eof)) {
+            try parser.method();
+        }
         parser.consume(.RightBrace, "Expect '}' after class body.");
+        try parser.writer.emitOp(.Pop);
+    }
+
+    fn method(parser: *Parser) !void {
+        parser.consume(.Identifier, "Expect method name.");
+        const constant = try parser.identifierConstant(parser.previous);
+        try parser.function(.Function);
+
+        try parser.writer.emitOp(.Method);
+        try parser.writer.emit(constant);
     }
 
     fn function(parser: *Parser, funTy: FunctionType) !void {
@@ -3227,20 +3281,22 @@ test "set and get property" {
         \\a.foo;
     ,
         \\== <script> ==
-        \\0000 Class          0
+        \\0000 Class          0 A
         \\0002 DefineGlobal   0 A
         \\0004 GetGlobal      0 A
-        \\0006 Call           0
-        \\0008 DefineGlobal   1 a
-        \\0010 GetGlobal      1 a
-        \\0012 Constant       3 1
-        \\0014 SetProperty    2
-        \\0016 Pop
-        \\0017 GetGlobal      1 a
-        \\0019 GetProperty    2
-        \\0021 Pop
-        \\0022 Nil
-        \\0023 Return
+        \\0006 Pop
+        \\0007 GetGlobal      0 A
+        \\0009 Call           0
+        \\0011 DefineGlobal   1 a
+        \\0013 GetGlobal      1 a
+        \\0015 Constant       3 1
+        \\0017 SetProperty    2 foo
+        \\0019 Pop
+        \\0020 GetGlobal      1 a
+        \\0022 GetProperty    2 foo
+        \\0024 Pop
+        \\0025 Nil
+        \\0026 Return
         \\
     );
     try parse_error(
@@ -3259,7 +3315,7 @@ test "del property" {
     ,
         \\== <script> ==
         \\0000 GetGlobal      0 a
-        \\0002 DelProperty    1
+        \\0002 DelProperty    1 b
         \\0004 Pop
         \\0005 Nil
         \\0006 Return
