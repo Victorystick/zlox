@@ -417,6 +417,7 @@ const OpCode = enum(u8) {
     /// A backwards jump, used for loops.
     Loop,
     Call,
+    Invoke, // Optimized method call.
     Closure,
     Class,
     Method,
@@ -512,6 +513,13 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
             return offset + 3;
         },
         .Call => byteInstruction("Call", chunk, offset, io),
+        .Invoke => {
+            const constantIndex = chunk.code[offset + 1];
+            const constant = chunk.constants[constantIndex];
+            const argCount = chunk.code[offset + 2];
+            try io.print("{s: <12} {d: >3} {f} ({d} args)\n", .{ "Invoke", constantIndex, constant, argCount });
+            return offset + 3;
+        },
         .Closure => {
             // Read the following constant.
             const constantIndex = chunk.code[offset + 1];
@@ -607,6 +615,10 @@ pub const ChunkWriter = struct {
 
     pub fn emit(self: *ChunkWriter, byte: u8) !void {
         try self.code.append(self.gpa, byte);
+    }
+
+    fn emitSlice(self: *ChunkWriter, bytes: []const u8) !void {
+        try self.code.appendSlice(self.gpa, bytes);
     }
 
     pub fn emitOp(self: *ChunkWriter, op: OpCode) !void {
@@ -752,6 +764,7 @@ pub const VM = struct {
 
     // A linked list of all allocated objects.
     objects: ?*ObjectNode = null,
+    createdObjectCount: usize = 0,
     grayStack: std.ArrayList(*ObjectNode) = .empty,
     isCollecting: bool = false,
 
@@ -969,6 +982,8 @@ pub const VM = struct {
 
     fn createObject(vm: *VM, data: Object) !*Object {
         const node = try vm.alloc.create(ObjectNode);
+
+        vm.createdObjectCount += 1;
         if (comptime debug.LogGC) {
             std.debug.print("  Create  {s: <10}: {f}\n", .{ @tagName(@as(ObjectType, data)), data });
         }
@@ -1260,37 +1275,12 @@ pub const VM = struct {
                 },
                 .Call => {
                     const argCount = frame.byte();
-                    switch (vm.peek(argCount)) {
-                        .obj => switch (vm.peek(argCount).obj.*) {
-                            .closure => |*closure| {
-                                frame = try vm.call(closure, argCount);
-                            },
-                            .native => |native| {
-                                const args = vm.stack[vm.stackTop - argCount .. vm.stackTop];
-                                const result = try native.function(vm, args);
-                                vm.stackTop -= argCount + 1;
-                                vm.push(result);
-                            },
-                            .boundMethod => |*bound| {
-                                //
-                                vm.stack[vm.stackTop - (argCount + 1)] = bound.receiver;
-                                frame = try vm.call(bound.method, argCount);
-                            },
-                            .class => |*class| {
-                                const obj = try vm.createObject(.{ .instance = .{ .class = class } });
-                                vm.stack[vm.stackTop - (argCount + 1)] = .{ .obj = obj };
-                                if (class.methods.get(&initString)) |initializer| {
-                                    frame = try vm.call(initializer.as(Closure) orelse unreachable, argCount);
-                                } else if (argCount != 0) {
-                                    return vm.runtimeError("Expected 0 arguments but got {d}\n", .{argCount});
-                                }
-                            },
-                            else => return vm.runtimeError("Can only call functions and classes!\n", .{}),
-                        },
-                        else => {
-                            return vm.runtimeError("Can only call functions and classes!\n", .{});
-                        },
-                    }
+                    frame = try vm.callValue(vm.peek(argCount), argCount);
+                },
+                .Invoke => {
+                    const method = frame.constant().as(String) orelse unreachable;
+                    const argCount = frame.byte();
+                    frame = try vm.invoke(method, argCount);
                 },
                 .Closure => {
                     const constant = frame.constant();
@@ -1472,6 +1462,44 @@ pub const VM = struct {
         return obj;
     }
 
+    fn callValue(vm: *VM, value: Value, argCount: usize) !*CallFrame {
+        switch (value) {
+            .obj => switch (value.obj.*) {
+                .closure => |*closure| {
+                    return try vm.call(closure, argCount);
+                },
+                .native => |native| {
+                    const args = vm.stack[vm.stackTop - argCount .. vm.stackTop];
+                    const result = try native.function(vm, args);
+                    vm.stackTop -= argCount + 1;
+                    vm.push(result);
+                    // Same frame.
+                    return &vm.frames[vm.frameCount - 1];
+                },
+                .boundMethod => |*bound| {
+                    //
+                    vm.stack[vm.stackTop - (argCount + 1)] = bound.receiver;
+                    return try vm.call(bound.method, argCount);
+                },
+                .class => |*class| {
+                    const obj = try vm.createObject(.{ .instance = .{ .class = class } });
+                    vm.stack[vm.stackTop - (argCount + 1)] = .{ .obj = obj };
+                    if (class.methods.get(&initString)) |initializer| {
+                        return try vm.call(initializer.as(Closure) orelse unreachable, argCount);
+                    } else if (argCount != 0) {
+                        return vm.runtimeError("Expected 0 arguments but got {d}\n", .{argCount});
+                    }
+                    // Same frame.
+                    return &vm.frames[vm.frameCount - 1];
+                },
+                else => return vm.runtimeError("Can only call functions and classes!\n", .{}),
+            },
+            else => {
+                return vm.runtimeError("Can only call functions and classes!\n", .{});
+            },
+        }
+    }
+
     fn call(vm: *VM, callee: *const Closure, argCount: usize) !*CallFrame {
         const arity = callee.function.arity;
         if (argCount != arity) {
@@ -1488,6 +1516,25 @@ pub const VM = struct {
         const frame = &vm.frames[vm.frameCount];
         vm.frameCount += 1;
         return frame;
+    }
+
+    fn invoke(vm: *VM, name: *const String, argCount: usize) !*CallFrame {
+        const instance = vm.peek(argCount).as(Instance) orelse {
+            return vm.runtimeError("Only instances have methods.", .{});
+        };
+        // Handle what looks like a method invocation, but is for a field.
+        if (instance.fields.get(name)) |field| {
+            vm.stack[vm.stackTop - (argCount + 1)] = field;
+            return vm.callValue(field, argCount);
+        }
+        return vm.invokeFromClass(instance.class, name, argCount);
+    }
+
+    fn invokeFromClass(vm: *VM, class: *Class, name: *const String, argCount: usize) !*CallFrame {
+        const value = class.methods.get(name) orelse {
+            return vm.runtimeError("Undefined property '{s}'.\n", .{name.chars});
+        };
+        return vm.call(value.as(Closure) orelse unreachable, argCount);
     }
 
     fn captureUpvalue(vm: *VM, local: *Value) !*Upvalue {
@@ -2172,10 +2219,14 @@ const Parser = struct {
         if (canAssign and parser.match(.Equal)) {
             try parser.expression();
             try parser.writer.emitOp(.SetProperty);
+            try parser.writer.emit(name);
+        } else if (parser.match(.LeftParen)) {
+            const argCount = try parser.argumentList();
+            try parser.writer.emitSlice(&.{ @intFromEnum(OpCode.Invoke), name, argCount });
         } else {
             try parser.writer.emitOp(.GetProperty);
+            try parser.writer.emit(name);
         }
-        try parser.writer.emit(name);
     }
 
     fn del(parser: *Parser, _: bool) !void {
@@ -3274,32 +3325,13 @@ test "print the same" {
 }
 
 test "persist functions" {
-    const alloc = std.testing.allocator;
-
-    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
-    const output_writer = &output.writer;
-    defer output.deinit();
-
-    var stack: [128]Value = undefined;
-    var vm = VM.init(alloc, output_writer, &stack);
-    defer vm.deinit();
-
-    _ = try vm.interpret(
+    try runs(&.{
         \\fun spooky() {
         \\  print "boo!";
         \\}
-    );
-
-    vm.gc() catch {};
-
-    _ = try vm.interpret(
+        ,
         \\spooky();
-    );
-
-    try std.testing.expectEqualStrings(
-        \\boo!
-        \\
-    , output.written());
+    }, "boo!\n");
 }
 
 test "pair" {
@@ -3393,7 +3425,6 @@ test "call method without receiver" {
         \\var scone = Scone();
         \\scone.topping("berries", "cream");
     ;
-    try run(code, "scone with berries and cream\n");
     try bytecode(code,
         \\== <script> ==
         \\0000 Class          0 Scone
@@ -3406,15 +3437,15 @@ test "call method without receiver" {
         \\0013 Call           0
         \\0015 DefineGlobal   3 scone
         \\0017 GetGlobal      3 scone
-        \\0019 GetProperty    1 topping
-        \\0021 Constant       4 berries
-        \\0023 Constant       5 cream
-        \\0025 Call           2
-        \\0027 Pop
-        \\0028 Nil
-        \\0029 Return
+        \\0019 Constant       4 berries
+        \\0021 Constant       5 cream
+        \\0023 Invoke         1 topping (2 args)
+        \\0026 Pop
+        \\0027 Nil
+        \\0028 Return
         \\
     );
+    try run(code, "scone with berries and cream\n");
 }
 
 test "call method with nested function" {
@@ -3470,9 +3501,22 @@ test "initializer bad return" {
     );
 }
 
-test "invoke" {
-    const code =
-        \\ class Thing { go() {} }
-        \\ Thing().go();
-    ;
+test "invoke field" {
+    try run(
+        \\class Oops {
+        \\  init() {
+        \\    fun f() {
+        \\      print "not a method";
+        \\    }
+        \\
+        \\    this.field = f;
+        \\  }
+        \\}
+        \\
+        \\var oops = Oops();
+        \\oops.field();
+    ,
+        \\not a method
+        \\
+    );
 }
