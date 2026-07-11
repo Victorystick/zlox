@@ -768,6 +768,8 @@ pub const VM = struct {
     grayStack: std.ArrayList(*ObjectNode) = .empty,
     isCollecting: bool = false,
 
+    benchmarkEndTime: std.Io.Timestamp = .{ .nanoseconds = 0 },
+
     // Unlike the book, we need not mark or free this.
     const initString = String.unowned("init");
 
@@ -2220,6 +2222,7 @@ const Parser = struct {
             try parser.expression();
             try parser.writer.emitOp(.SetProperty);
             try parser.writer.emit(name);
+            // Remove this else-if block to de-optimize method calls.
         } else if (parser.match(.LeftParen)) {
             const argCount = try parser.argumentList();
             try parser.writer.emitSlice(&.{ @intFromEnum(OpCode.Invoke), name, argCount });
@@ -3176,6 +3179,56 @@ test "native" {
         \\
     , output.written());
 }
+
+// 28.5 - Optimized Invocations
+// https://craftinginterpreters.com/methods-and-initializers.html#optimized-invocations
+//
+// Running this loop for 1 second on a M3 Pro (on battery) yielded:
+// 1. No opt:
+//    -    18,473 iterations
+//    -    18,486 allocations
+// 2. With opt:
+//    - 1,164,310 iterations
+//    -        13 allocations
+// a 63x performance improvement. We skip this benchmark while developing.
+//
+// test "loop perf" {
+//     const alloc = std.testing.allocator;
+
+//     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+//     const output_writer = &output.writer;
+//     defer output.deinit();
+
+//     var stack: [128]Value = undefined;
+//     var vm = VM.init(alloc, output_writer, &stack);
+//     defer vm.deinit();
+
+//     vm.benchmarkEndTime = std.Io.Clock.now(.awake, std.testing.io).addDuration(.fromSeconds(1));
+
+//     try vm.defineNative("run", struct {
+//         fn run(it: *VM, _: []Value) NativeErr!Value {
+//             const go = std.Io.Clock.now(.awake, std.testing.io).nanoseconds < it.benchmarkEndTime.nanoseconds;
+//             return .{ .bool = go };
+//         }
+//     }.run);
+
+//     //
+
+//     _ = try vm.interpret(
+//         \\var calls = 0;
+//         \\class C { method() { calls = calls + 1; } }
+//         \\var instance = C();
+//         \\
+//         \\while(run()) {
+//         \\  instance.method();
+//         \\}
+//     );
+
+//     const callsName = String.unowned("calls");
+//     const calls = (vm.globals.get(&callsName) orelse unreachable).float;
+//     std.debug.print("Iterations: {d}\n", .{calls});
+//     std.debug.print("Object creations: {d}\n", .{vm.createdObjectCount});
+// }
 
 test "read outer scope upvalue" {
     try run(
