@@ -145,6 +145,11 @@ const String = struct {
         alloc.free(self.chars);
     }
 
+    /// Returns true if the string contains "init".
+    fn isInit(self: String) bool {
+        return std.mem.eql(u8, self.chars, "init");
+    }
+
     // Creates a new string that borrows the given one. The returned string
     // does not own its memory and must not be freed.
     fn unowned(str: []const u8) String {
@@ -255,6 +260,8 @@ const Class = struct {
     // Unowned.
     name: *String,
     methods: ValueMap = .empty,
+    /// The initializer, if any.
+    init: ?*Closure = null,
 
     pub fn deinit(self: *Class, alloc: std.mem.Allocator) void {
         self.methods.deinit(alloc);
@@ -907,6 +914,9 @@ pub const VM = struct {
                     try vm.markValueMap(&i.fields);
                 },
                 .class => |*c| {
+                    if (c.init) |initializer| {
+                        try vm.mark(@fieldParentPtr("closure", initializer));
+                    }
                     try vm.markValueMap(&c.methods);
                 },
                 .boundMethod => |*m| {
@@ -1339,6 +1349,9 @@ pub const VM = struct {
                     const class = vm.peek(1).as(Class) orelse {
                         return vm.runtimeError("Only classes have methods.\n", .{});
                     };
+                    if (name.isInit()) {
+                        class.init = method.as(Closure);
+                    }
                     try class.methods.put(vm.alloc, name, method);
                     _ = vm.pop();
                 },
@@ -1486,8 +1499,8 @@ pub const VM = struct {
                 .class => |*class| {
                     const obj = try vm.createObject(.{ .instance = .{ .class = class } });
                     vm.stack[vm.stackTop - (argCount + 1)] = .{ .obj = obj };
-                    if (class.methods.get(&initString)) |initializer| {
-                        return try vm.call(initializer.as(Closure) orelse unreachable, argCount);
+                    if (class.init) |initializer| {
+                        return try vm.call(initializer, argCount);
                     } else if (argCount != 0) {
                         return vm.runtimeError("Expected 0 arguments but got {d}\n", .{argCount});
                     }
@@ -1533,6 +1546,11 @@ pub const VM = struct {
     }
 
     fn invokeFromClass(vm: *VM, class: *Class, name: *const String, argCount: usize) !*CallFrame {
+        if (name.isInit()) {
+            if (class.init) |initializer| {
+                return vm.call(initializer, argCount);
+            }
+        }
         const value = class.methods.get(name) orelse {
             return vm.runtimeError("Undefined property '{s}'.\n", .{name.chars});
         };
@@ -3180,6 +3198,39 @@ test "native" {
     , output.written());
 }
 
+/// Runs the given source for 1 second; printing some stats. It has access to
+/// a global `run` function, which returns true as long as the benchmark should
+/// continue to run. Every iteration, the `calls` global should be incremented.
+fn bench(source: []const u8) !void {
+    const stderr = std.Io.File.stderr();
+    var buf: [1024]u8 = undefined;
+    var writer = stderr.writer(std.testing.io, &buf);
+
+    const alloc = std.testing.allocator;
+
+    var stack: [128]Value = undefined;
+    var vm = VM.init(alloc, &writer.interface, &stack);
+    defer vm.deinit();
+
+    const callsName = String.unowned("calls");
+    try vm.globals.put(alloc, &callsName, .{ .float = 0 });
+
+    vm.benchmarkEndTime = std.Io.Clock.now(.awake, std.testing.io).addDuration(.fromSeconds(1));
+
+    try vm.defineNative("run", struct {
+        fn run(it: *VM, _: []Value) NativeErr!Value {
+            const go = std.Io.Clock.now(.awake, std.testing.io).nanoseconds < it.benchmarkEndTime.nanoseconds;
+            return .{ .bool = go };
+        }
+    }.run);
+
+    _ = try vm.interpret(source);
+
+    const calls = (vm.globals.get(&callsName) orelse unreachable).float;
+    std.debug.print("Iterations: {d}\n", .{calls});
+    std.debug.print("Object creations: {d}\n", .{vm.createdObjectCount});
+}
+
 // 28.5 - Optimized Invocations
 // https://craftinginterpreters.com/methods-and-initializers.html#optimized-invocations
 //
@@ -3192,30 +3243,8 @@ test "native" {
 //    -        13 allocations
 // a 63x performance improvement. We skip this benchmark while developing.
 //
-// test "loop perf" {
-//     const alloc = std.testing.allocator;
-
-//     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
-//     const output_writer = &output.writer;
-//     defer output.deinit();
-
-//     var stack: [128]Value = undefined;
-//     var vm = VM.init(alloc, output_writer, &stack);
-//     defer vm.deinit();
-
-//     vm.benchmarkEndTime = std.Io.Clock.now(.awake, std.testing.io).addDuration(.fromSeconds(1));
-
-//     try vm.defineNative("run", struct {
-//         fn run(it: *VM, _: []Value) NativeErr!Value {
-//             const go = std.Io.Clock.now(.awake, std.testing.io).nanoseconds < it.benchmarkEndTime.nanoseconds;
-//             return .{ .bool = go };
-//         }
-//     }.run);
-
-//     //
-
-//     _ = try vm.interpret(
-//         \\var calls = 0;
+// test "benchmark method invocations" {
+//     try bench(
 //         \\class C { method() { calls = calls + 1; } }
 //         \\var instance = C();
 //         \\
@@ -3223,11 +3252,6 @@ test "native" {
 //         \\  instance.method();
 //         \\}
 //     );
-
-//     const callsName = String.unowned("calls");
-//     const calls = (vm.globals.get(&callsName) orelse unreachable).float;
-//     std.debug.print("Iterations: {d}\n", .{calls});
-//     std.debug.print("Object creations: {d}\n", .{vm.createdObjectCount});
 // }
 
 test "read outer scope upvalue" {
