@@ -425,8 +425,11 @@ const OpCode = enum(u8) {
     Loop,
     Call,
     Invoke, // Optimized method call.
+    SuperInvoke, // Optimized super method call.
     Closure,
     Class,
+    Inherit,
+    GetSuper,
     Method,
     GetProperty,
     SetProperty,
@@ -487,6 +490,8 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
         .GetUpvalue => byteInstruction("GetUpvalue", chunk, offset, io),
         .SetUpvalue => byteInstruction("SetUpvalue", chunk, offset, io),
         .Class => constantInstruction("Class", chunk, offset, io),
+        .Inherit => simpleInstruction("Inherit", offset, io),
+        .GetSuper => constantInstruction("GetSuper", chunk, offset, io),
         .Method => constantInstruction("Method", chunk, offset, io),
         .CloseUpvalue => simpleInstruction("CloseUpvalue", offset, io),
         .Return => simpleInstruction("Return", offset, io),
@@ -525,6 +530,13 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
             const constant = chunk.constants[constantIndex];
             const argCount = chunk.code[offset + 2];
             try io.print("{s: <12} {d: >3} {f} ({d} args)\n", .{ "Invoke", constantIndex, constant, argCount });
+            return offset + 3;
+        },
+        .SuperInvoke => {
+            const constantIndex = chunk.code[offset + 1];
+            const constant = chunk.constants[constantIndex];
+            const argCount = chunk.code[offset + 2];
+            try io.print("{s: <12} {d: >3} {f} ({d} args)\n", .{ "SuperInvoke", constantIndex, constant, argCount });
             return offset + 3;
         },
         .Closure => {
@@ -920,7 +932,6 @@ pub const VM = struct {
                     try vm.markValueMap(&c.methods);
                 },
                 .boundMethod => |*m| {
-                    std.debug.print("DEBUG:: Marking receiver {f}\n", .{m.receiver});
                     try vm.markValue(&m.receiver);
                     try vm.mark(@fieldParentPtr("closure", m.method));
                 },
@@ -1128,7 +1139,7 @@ pub const VM = struct {
         const stderr = std.debug.lockStderr(&buf);
         defer std.debug.unlockStderr();
         var io = &stderr.file_writer.interface;
-        try io.writeAll("[ ");
+        try io.writeAll("  [ ");
         for (vm.stack[0..vm.stackTop]) |val| {
             try io.print("{f} ", .{val});
         }
@@ -1294,42 +1305,49 @@ pub const VM = struct {
                     const argCount = frame.byte();
                     frame = try vm.invoke(method, argCount);
                 },
+                .SuperInvoke => {
+                    const method = frame.constant().as(String) orelse unreachable;
+                    const argCount = frame.byte();
+                    const value = vm.pop();
+                    const class = value.as(Class) orelse unreachable;
+                    frame = try vm.invokeFromClass(class, method, argCount);
+                },
                 .Closure => {
                     const constant = frame.constant();
-                    if (constant.asFunction()) |function| {
-                        // Hack! Create an upvalue that points to the closure,
-                        // and use it for all upvalues before
-                        var val: Value = .{ .nil = {} };
-                        const tmp = try vm.pushObj(.{ .upvalue = .{ .location = &val } });
-                        defer _ = vm.pop();
-
-                        const closure = try Closure.init(vm.alloc, function);
-                        errdefer closure.deinit(vm.alloc);
-                        const self = try vm.pushObj(.{ .closure = closure });
-
-                        // Hack! Swap the closure with the temp value.
-                        vm.swap();
-
-                        val = .{ .obj = self };
-
-                        // Hack! Point all upvalues to the closure itself. That
-                        // ensures that iterating
-                        for (closure.upvalues) |*upvalue| {
-                            upvalue.* = &tmp.upvalue;
-                        }
-
-                        // Capture upvalues.
-                        for (closure.upvalues) |*upvalue| {
-                            const isLocal = frame.byte();
-                            const index = frame.byte();
-                            if (isLocal == 1) {
-                                upvalue.* = try vm.captureUpvalue(&frame.slots[index]);
-                            } else {
-                                upvalue.* = frame.closure.upvalues[index];
-                            }
-                        }
-                    } else {
+                    const function = constant.asFunction() orelse {
                         return vm.runtimeError("Expected function, got {f}!\n", .{constant});
+                    };
+
+                    // Hack! Create an upvalue that points to the closure,
+                    // and use it for all upvalues before
+                    var val: Value = .{ .nil = {} };
+                    const tmp = try vm.pushObj(.{ .upvalue = .{ .location = &val } });
+                    defer _ = vm.pop();
+
+                    const closure = try Closure.init(vm.alloc, function);
+                    errdefer closure.deinit(vm.alloc);
+                    const self = try vm.pushObj(.{ .closure = closure });
+
+                    // Hack! Swap the closure with the temp value.
+                    vm.swap();
+
+                    val = .{ .obj = self };
+
+                    // Hack! Point all upvalues to the closure itself. That
+                    // ensures that iterating
+                    for (closure.upvalues) |*upvalue| {
+                        upvalue.* = &tmp.upvalue;
+                    }
+
+                    // Capture upvalues.
+                    for (closure.upvalues) |*upvalue| {
+                        const isLocal = frame.byte();
+                        const index = frame.byte();
+                        if (isLocal == 1) {
+                            upvalue.* = try vm.captureUpvalue(&frame.slots[index]);
+                        } else {
+                            upvalue.* = frame.closure.upvalues[index];
+                        }
                     }
                 },
                 .Class => {
@@ -1340,6 +1358,19 @@ pub const VM = struct {
                     } else {
                         return error.RuntimeError;
                     }
+                },
+                .Inherit => {
+                    const super = vm.peek(1).as(Class) orelse {
+                        return vm.runtimeError("Superclass must be a class.\n", .{});
+                    };
+                    const class = vm.peek(0).as(Class) orelse unreachable;
+                    class.methods = try super.methods.clone(vm.alloc);
+                    _ = vm.pop(); // Subclass.
+                },
+                .GetSuper => {
+                    const name = frame.constant().as(String) orelse unreachable;
+                    const class = vm.pop().as(Class) orelse unreachable;
+                    try vm.bindMethod(class, name);
                 },
                 .Method => {
                     const name = frame.constant().asString() orelse {
@@ -1367,16 +1398,8 @@ pub const VM = struct {
                     if (instance.fields.get(name)) |value| {
                         _ = vm.pop(); // instance
                         vm.push(value);
-                    } else if (instance.class.methods.get(name)) |method| {
-                        // Keep a ref to the instance through the bound method.
-                        _ = try vm.pushObj(.{ .boundMethod = .{
-                            .method = method.as(Closure) orelse unreachable,
-                            .receiver = vm.peek(0),
-                        } });
-                        vm.swap(); // Swap the bound method below the instance.
-                        _ = vm.pop();
                     } else {
-                        return vm.runtimeError("Undefined property '{s}'.\n", .{name.chars});
+                        try vm.bindMethod(instance.class, name);
                     }
                 },
                 .SetProperty => {
@@ -1512,6 +1535,20 @@ pub const VM = struct {
             else => {
                 return vm.runtimeError("Can only call functions and classes!\n", .{});
             },
+        }
+    }
+
+    fn bindMethod(vm: *VM, class: *Class, name: *const String) !void {
+        if (class.methods.get(name)) |method| {
+            // Keep a ref to the instance through the bound method.
+            _ = try vm.pushObj(.{ .boundMethod = .{
+                .method = method.as(Closure) orelse unreachable,
+                .receiver = vm.peek(0),
+            } });
+            vm.swap(); // Swap the bound method below the instance.
+            _ = vm.pop();
+        } else {
+            return vm.runtimeError("Undefined property '{s}'.\n", .{name.chars});
         }
     }
 
@@ -1978,25 +2015,21 @@ const Compiler = struct {
         return compiler;
     }
 
-    fn withinClass(self: *const Self) bool {
-        // The book defines an "enclosing class", but I don't see why we need one.
-        // It should be enough to see if we're in scope of a class-only fn type.
-        if (self.writer.fnType.isClassOnly()) return true;
-        const parent = self.enclosing orelse return false;
-        return parent.withinClass();
-    }
-
     fn deinit(self: *Self) void {
         self.writer.deinit();
     }
 
-    fn pop(self: *Self) u8 {
+    fn endScope(self: *Self) !void {
         self.scopeDepth -= 1;
-        var count: u8 = 0;
+
         while (self.localCount > 0 and self.locals[self.localCount - 1].depth > self.scopeDepth) : (self.localCount -= 1) {
-            count += 1;
+            const local = self.locals[self.localCount - 1];
+            if (local.isCaptured) {
+                try self.writer.emitOp(.CloseUpvalue);
+            } else {
+                try self.writer.emitOp(.Pop);
+            }
         }
-        return count;
     }
 
     fn addLocal(self: *Self, name: Token) !void {
@@ -2104,6 +2137,14 @@ const Parser = struct {
     previous: Token = undefined,
     hadError: bool = false,
     panicMode: bool = false,
+    currentClass: ?*CurrentClass = null,
+
+    const CurrentClass = struct {
+        const Self = @This();
+
+        enclosing: ?*Self = null,
+        hasSuperclass: bool = false,
+    };
 
     fn init(alloc: std.mem.Allocator, err: *std.Io.Writer, source: []const u8) !Parser {
         const compiler = try alloc.create(Compiler);
@@ -2300,8 +2341,42 @@ const Parser = struct {
         }
     }
 
+    fn special(parser: *Parser, source: []const u8) Token {
+        var tok = parser.previous;
+        tok.type = .Special;
+        tok.source = source;
+        return tok;
+    }
+
+    fn super(parser: *Parser, _: bool) !void {
+        if (parser.currentClass) |class| {
+            if (!class.hasSuperclass) {
+                parser.errorAt(parser.current, "Can't use 'super' in a class with no superclass.");
+            }
+        } else {
+            parser.errorAt(parser.current, "Can't use 'super' outside of class.");
+        }
+
+        parser.consume(.Dot, "Expect '.' after 'super'.");
+        parser.consume(.Identifier, "Expect superclass method name.");
+        const name = try parser.identifierConstant(parser.previous);
+        try parser.namedVariable(parser.special("this"), false);
+
+        if (parser.match(.LeftParen)) {
+            const argCount = try parser.argumentList();
+            try parser.namedVariable(parser.special("super"), false);
+            try parser.writer.emitOp(.SuperInvoke);
+            try parser.writer.emit(name);
+            try parser.writer.emit(argCount);
+        } else {
+            try parser.namedVariable(parser.special("super"), false);
+            try parser.writer.emitOp(.GetSuper);
+            try parser.writer.emit(name);
+        }
+    }
+
     fn this(parser: *Parser, _: bool) !void {
-        if (!parser.compiler.withinClass()) {
+        if (parser.currentClass == null) {
             parser.errorAt(parser.previous, "Can't use 'this' outside of a class.");
             return;
         }
@@ -2518,16 +2593,7 @@ const Parser = struct {
     }
 
     fn endScope(parser: *Parser) !void {
-        var localCount = parser.compiler.pop();
-
-        while (localCount > 0) {
-            localCount -= 1;
-            if (parser.compiler.locals[localCount].isCaptured) {
-                try parser.writer.emitOp(.CloseUpvalue);
-            } else {
-                try parser.writer.emitOp(.Pop);
-            }
-        }
+        return parser.compiler.endScope();
     }
 
     fn statement(parser: *Parser) !void {
@@ -2568,6 +2634,27 @@ const Parser = struct {
         try parser.compiler.writer.emit(nameConstant);
         try parser.defineVariable(nameConstant);
 
+        var current: CurrentClass = .{ .enclosing = parser.currentClass };
+        parser.currentClass = &current;
+        defer parser.currentClass = current.enclosing;
+
+        if (parser.match(.Less)) {
+            parser.consume(.Identifier, "Expect superclass name.");
+            try parser.variable(false);
+
+            if (std.mem.eql(u8, className.source, parser.previous.source)) {
+                parser.errorAt(parser.previous, "A class can't inherit from itself.");
+            }
+
+            current.hasSuperclass = true;
+            parser.beginScope();
+            try parser.compiler.addLocal(parser.special("super"));
+            try parser.defineVariable(0);
+
+            try parser.namedVariable(className, false);
+            try parser.writer.emitOp(.Inherit);
+        }
+
         try parser.namedVariable(className, false);
         parser.consume(.LeftBrace, "Expect '{' before class body.");
         while (!parser.check(.RightBrace) and !parser.check(.Eof)) {
@@ -2575,6 +2662,10 @@ const Parser = struct {
         }
         parser.consume(.RightBrace, "Expect '}' after class body.");
         try parser.writer.emitOp(.Pop);
+
+        if (current.hasSuperclass) {
+            try parser.endScope();
+        }
     }
 
     fn method(parser: *Parser) !void {
@@ -2771,6 +2862,7 @@ const Parser = struct {
             .False => Rule{ .prefix = literal },
             .True => Rule{ .prefix = literal },
             .This => Rule{ .prefix = this },
+            .Super => Rule{ .prefix = super },
             .Nil => Rule{ .prefix = literal },
             .Bang => Rule{ .prefix = unary },
             .Del => Rule{ .prefix = del },
@@ -2834,7 +2926,6 @@ const gcVtable = struct {
     }
 
     fn gcAlloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        // std.debug.print("Allocating {d} bytes\n", .{len});
         var meta: *GcMeta = @ptrCast(@alignCast(ptr));
         const res = meta.alloc.vtable.alloc(meta.alloc.ptr, len, alignment, ret_addr);
         if (res) |_| {
@@ -3594,6 +3685,33 @@ test "invoke field" {
         \\oops.field();
     ,
         \\not a method
+        \\
+    );
+}
+
+test "call super" {
+    try run(
+        \\class Doughnut {
+        \\  cook() {
+        \\    print "Dunk in the fryer.";
+        \\    this.finish("sprinkles");
+        \\  }
+        \\
+        \\  finish(ingredient) {
+        \\    print "Finish with " + ingredient;
+        \\  }
+        \\}
+        \\
+        \\class Cruller < Doughnut {
+        \\  finish(ingredient) {
+        \\    // No sprinkles, always icing.
+        \\    super.finish("icing");
+        \\  }
+        \\}
+        \\Cruller().cook();
+    ,
+        \\Dunk in the fryer.
+        \\Finish with icing
         \\
     );
 }
