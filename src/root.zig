@@ -10,19 +10,33 @@ const debug = .{
     .LogGC = false,
 };
 
+pub const Value = TaggedValue;
+
 const ValueType = enum {
     nil,
     bool,
     float,
     obj,
 };
-pub const Value = union(ValueType) {
+const TaggedValue = union(ValueType) {
+    const Self = @This();
+
     nil,
     bool: bool,
     float: f64,
     obj: *Object,
 
-    pub fn deinit(self: Value, alloc: std.mem.Allocator) void {
+    /// A wrapper around object creation.
+    pub fn object(obj: *Object) Value {
+        return .{ .obj = obj };
+    }
+
+    /// A wrapper around boolean creation.
+    pub fn boolean(b: bool) Value {
+        return .{ .bool = b };
+    }
+
+    pub fn deinit(self: Self, alloc: std.mem.Allocator) void {
         switch (self) {
             .obj => |obj| {
                 obj.deinit(alloc);
@@ -32,7 +46,7 @@ pub const Value = union(ValueType) {
         }
     }
 
-    pub fn format(self: Value, writer: *std.Io.Writer) !void {
+    pub fn format(self: Self, writer: *std.Io.Writer) !void {
         try switch (self) {
             .nil => writer.writeAll("nil"),
             .float => |fl| writer.print("{d}", .{fl}),
@@ -41,7 +55,7 @@ pub const Value = union(ValueType) {
         };
     }
 
-    fn equals(self: Value, other: Value) bool {
+    fn equals(self: Self, other: Value) bool {
         if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
 
         // The values share the same tag. Let's check their contents.
@@ -53,7 +67,7 @@ pub const Value = union(ValueType) {
         };
     }
 
-    fn isFalsey(self: Value) bool {
+    fn isFalsey(self: Self) bool {
         return switch (self) {
             .nil => true,
             .bool => |b| !b,
@@ -61,14 +75,14 @@ pub const Value = union(ValueType) {
         };
     }
 
-    fn isNumber(self: Value) bool {
+    fn isNumber(self: Self) bool {
         return switch (self) {
             .float => true,
             else => false,
         };
     }
 
-    fn isString(self: Value) bool {
+    fn isString(self: Self) bool {
         return switch (self) {
             .obj => switch (self.obj.*) {
                 .string => true,
@@ -78,25 +92,15 @@ pub const Value = union(ValueType) {
         };
     }
 
-    fn asString(self: Value) ?*String {
+    fn asObject(self: Self) ?*Object {
         return switch (self) {
-            .obj => self.obj.asString(),
-            else => null,
-        };
-    }
-
-    fn asFunction(self: Value) ?*const Function {
-        return switch (self) {
-            .obj => switch (self.obj.*) {
-                .function => |*f| f,
-                else => null,
-            },
+            .obj => |obj| obj,
             else => null,
         };
     }
 
     /// Returns the value as `ty`, or null.
-    fn as(self: Value, comptime ty: type) ?*ty {
+    fn as(self: Self, comptime ty: type) ?*ty {
         return switch (self) {
             .obj => |obj| obj.as(ty),
             inline else => |*val| {
@@ -105,23 +109,6 @@ pub const Value = union(ValueType) {
                 }
                 return null;
             },
-        };
-    }
-
-    fn asInstance(self: Value) ?*Instance {
-        return switch (self) {
-            .obj => switch (self.obj.*) {
-                .instance => |*i| i,
-                else => null,
-            },
-            else => null,
-        };
-    }
-
-    fn mark(self: Value) void {
-        return switch (self) {
-            .obj => |o| o.mark(),
-            else => {},
         };
     }
 };
@@ -371,11 +358,6 @@ const Object = union(ObjectType) {
         };
     }
 
-    fn mark(self: *Object) void {
-        const node: *VM.ObjectNode = @fieldParentPtr("data", self);
-        node.isMarked = true;
-    }
-
     pub fn format(self: Object, writer: *std.Io.Writer) !void {
         try switch (self) {
             .string => |string| writer.writeAll(string.chars),
@@ -545,7 +527,7 @@ fn disassembleInstruction(chunk: *const Chunk, offset: usize, io: *std.Io.Writer
             const constant = chunk.constants[constantIndex];
             try io.print("{s: <12} {d: >3} {f}\n", .{ "Closure", constantIndex, constant });
 
-            if (constant.asFunction()) |function| {
+            if (constant.as(Function)) |function| {
                 // Read the upvalue count.
                 var upvalueOffset = offset + 2;
                 for (0..function.upvalueCount) |_| {
@@ -683,7 +665,7 @@ pub const ChunkWriter = struct {
     pub fn makeString(self: *ChunkWriter, str: []const u8) !u8 {
         // Don't allocate the same string twice.
         for (0..self.constants.items.len) |i| {
-            if (self.constants.items[i].asString()) |other| {
+            if (self.constants.items[i].as(String)) |other| {
                 if (std.mem.eql(u8, str, other.chars)) {
                     return @intCast(i);
                 }
@@ -693,7 +675,7 @@ pub const ChunkWriter = struct {
         const obj = try self.gpa.create(Object);
         errdefer self.gpa.destroy(obj);
         obj.* = Object{ .string = try String.init(self.gpa, str) };
-        return try self.makeConstant(Value{ .obj = obj });
+        return try self.makeConstant(Value.object(obj));
     }
 
     pub fn emitString(self: *ChunkWriter, str: []const u8) !void {
@@ -844,7 +826,7 @@ pub const VM = struct {
     }
 
     fn markRoots(vm: *VM) !void {
-        for (vm.stack[0..vm.stackTop]) |*val| {
+        for (vm.stack[0..vm.stackTop]) |val| {
             try vm.markValue(val);
         }
 
@@ -874,14 +856,13 @@ pub const VM = struct {
             // The key_ptr points to the ObjectNode in the global map.
             // It must be cast to *Object to use vm.mark
             try vm.mark(@constCast(@fieldParentPtr("string", entry.key_ptr.*)));
-            try vm.markValue(entry.value_ptr);
+            try vm.markValue(entry.value_ptr.*);
         }
     }
 
-    fn markValue(vm: *VM, val: *Value) !void {
-        switch (val.*) {
-            .obj => |o| try vm.mark(o),
-            else => {},
+    fn markValue(vm: *VM, val: Value) !void {
+        if (val.asObject()) |o| {
+            try vm.mark(o);
         }
     }
 
@@ -907,7 +888,7 @@ pub const VM = struct {
             switch (node.data) {
                 .string => {},
                 .function => |function| {
-                    for (function.chunk.constants) |*constant| {
+                    for (function.chunk.constants) |constant| {
                         try vm.markValue(constant);
                     }
                 },
@@ -919,7 +900,7 @@ pub const VM = struct {
                     }
                 },
                 .upvalue => |upvalue| {
-                    try vm.markValue(upvalue.location);
+                    try vm.markValue(upvalue.location.*);
                 },
                 .instance => |*i| {
                     try vm.mark(@fieldParentPtr("class", i.class));
@@ -932,7 +913,7 @@ pub const VM = struct {
                     try vm.markValueMap(&c.methods);
                 },
                 .boundMethod => |*m| {
-                    try vm.markValue(&m.receiver);
+                    try vm.markValue(m.receiver);
                     try vm.mark(@fieldParentPtr("closure", m.method));
                 },
             }
@@ -977,7 +958,7 @@ pub const VM = struct {
                     vm.objects = current;
                 }
 
-                if (node.data.asString()) |string| {
+                if (node.data.as(String)) |string| {
                     _ = vm.strings.remove(string);
                 }
                 node.data.deinit(vm.alloc);
@@ -1021,7 +1002,7 @@ pub const VM = struct {
         const strObj = try vm.intern(String.unowned(name));
         const nativeObj = try vm.pushObj(.{ .native = .{ .function = function } });
 
-        try vm.globals.put(vm.alloc, &strObj.string, .{ .obj = nativeObj });
+        try vm.globals.put(vm.alloc, &strObj.string, Value.object(nativeObj));
 
         _ = vm.pop();
         _ = vm.pop();
@@ -1046,7 +1027,7 @@ pub const VM = struct {
             break :blk vm.createObject(.{ .closure = closure });
         };
         _ = vm.pop();
-        vm.push(.{ .obj = o });
+        vm.push(Value.object(o));
 
         _ = try vm.call(&o.closure, 0);
 
@@ -1082,25 +1063,22 @@ pub const VM = struct {
         // onto the stack and pop them off after we're done.
         var objectCount: usize = 0;
         for (0..chunk.constants.len) |i| {
-            switch (chunk.constants[i]) {
-                .obj => |o| {
-                    objectCount += 1;
-                    switch (o.*) {
-                        .string => |string| {
-                            const obj = try vm.intern(string);
-                            constants[i] = Value{ .obj = obj };
-                        },
-                        .function => |function| {
-                            const obj = try vm.cloneFn(function);
-                            constants[i] = Value{ .obj = obj };
-                        },
-                        // All other types only exist at runtime.
-                        else => @panic("Found unexpected object type in constants!"),
-                    }
-                },
-                else => {
-                    constants[i] = chunk.constants[i];
-                },
+            if (chunk.constants[i].asObject()) |o| {
+                objectCount += 1;
+                switch (o.*) {
+                    .string => |string| {
+                        const obj = try vm.intern(string);
+                        constants[i] = Value.object(obj);
+                    },
+                    .function => |function| {
+                        const obj = try vm.cloneFn(function);
+                        constants[i] = Value.object(obj);
+                    },
+                    // All other types only exist at runtime.
+                    else => @panic("Found unexpected object type in constants!"),
+                }
+            } else {
+                constants[i] = chunk.constants[i];
             }
         }
 
@@ -1168,7 +1146,7 @@ pub const VM = struct {
                 .Constant => {
                     const constant = frame.constant();
 
-                    if (constant.asString()) |str| {
+                    if (constant.as(String)) |str| {
                         _ = try vm.intern(str.*);
                     } else {
                         vm.push(constant);
@@ -1223,11 +1201,11 @@ pub const VM = struct {
                     _ = vm.pop();
                 },
                 .Nil => vm.push(.nil),
-                .True => vm.push(Value{ .bool = true }),
-                .False => vm.push(Value{ .bool = false }),
+                .True => vm.push(Value.boolean(true)),
+                .False => vm.push(Value.boolean(false)),
                 .Not => {
                     const val = vm.pop();
-                    vm.push(Value{ .bool = val.isFalsey() });
+                    vm.push(Value.boolean(val.isFalsey()));
                 },
                 .Return => {
                     const result = vm.pop();
@@ -1248,20 +1226,24 @@ pub const VM = struct {
                 },
                 .Negate => {
                     const val = vm.pop();
-                    switch (val) {
-                        .float => {},
-                        else => {
-                            return vm.runtimeError("Expected float!\n", .{});
-                        },
+                    if (!val.isNumber()) {
+                        return vm.runtimeError("Expected float!\n", .{});
                     }
                     vm.push(Value{ .float = -val.float });
                 },
                 .Add => {
-                    if (vm.peek(0).isNumber() and vm.peek(0).isNumber()) {
+                    const b = vm.peek(0);
+                    const a = vm.peek(1);
+
+                    if (a.isNumber() and b.isNumber()) {
                         // Reuse logic.
                         try vm.binop(.Add);
-                    } else if (vm.peek(0).isString() and vm.peek(0).isString()) {
-                        try vm.concatenate();
+                    } else if (a.as(String)) |aStr| {
+                        if (b.as(String)) |bStr| {
+                            try vm.concatenate(aStr, bStr);
+                        } else {
+                            return vm.runtimeError("Operands must be two strings!\n", .{});
+                        }
                     } else {
                         return vm.runtimeError("Operands must be two numbers or two strings!\n", .{});
                     }
@@ -1272,7 +1254,7 @@ pub const VM = struct {
                 .Equal => {
                     const b = vm.pop();
                     const a = vm.pop();
-                    vm.push(Value{ .bool = a.equals(b) });
+                    vm.push(Value.boolean(a.equals(b)));
                 },
                 .Greater => try vm.binop(.Greater),
                 .Less => try vm.binop(.Less),
@@ -1314,13 +1296,13 @@ pub const VM = struct {
                 },
                 .Closure => {
                     const constant = frame.constant();
-                    const function = constant.asFunction() orelse {
+                    const function = constant.as(Function) orelse {
                         return vm.runtimeError("Expected function, got {f}!\n", .{constant});
                     };
 
                     // Hack! Create an upvalue that points to the closure,
                     // and use it for all upvalues before
-                    var val: Value = .{ .nil = {} };
+                    var val: Value = .nil;
                     const tmp = try vm.pushObj(.{ .upvalue = .{ .location = &val } });
                     defer _ = vm.pop();
 
@@ -1331,7 +1313,7 @@ pub const VM = struct {
                     // Hack! Swap the closure with the temp value.
                     vm.swap();
 
-                    val = .{ .obj = self };
+                    val = Value.object(self);
 
                     // Hack! Point all upvalues to the closure itself. That
                     // ensures that iterating
@@ -1353,7 +1335,7 @@ pub const VM = struct {
                 .Class => {
                     const constant = frame.constant();
 
-                    if (constant.asString()) |str| {
+                    if (constant.as(String)) |str| {
                         _ = try vm.pushObj(.{ .class = .{ .name = str } });
                     } else {
                         return error.RuntimeError;
@@ -1373,7 +1355,7 @@ pub const VM = struct {
                     try vm.bindMethod(class, name);
                 },
                 .Method => {
-                    const name = frame.constant().asString() orelse {
+                    const name = frame.constant().as(String) orelse {
                         return vm.runtimeError("Only classes have methods.\n", .{});
                     };
                     const method = vm.peek(0);
@@ -1387,10 +1369,10 @@ pub const VM = struct {
                     _ = vm.pop();
                 },
                 .GetProperty => {
-                    const instance = vm.peek(0).asInstance() orelse {
+                    const instance = vm.peek(0).as(Instance) orelse {
                         return vm.runtimeError("Only instances have properties.\n", .{});
                     };
-                    const name = frame.constant().asString() orelse {
+                    const name = frame.constant().as(String) orelse {
                         return vm.runtimeError("Tried to access a non-string property!\n", .{});
                     };
 
@@ -1403,10 +1385,10 @@ pub const VM = struct {
                     }
                 },
                 .SetProperty => {
-                    const instance = vm.peek(1).asInstance() orelse {
+                    const instance = vm.peek(1).as(Instance) orelse {
                         return vm.runtimeError("Only instances have properties.\n", .{});
                     };
-                    const name = frame.constant().asString() orelse {
+                    const name = frame.constant().as(String) orelse {
                         return vm.runtimeError("Tried to access a non-string property!\n", .{});
                     };
                     try instance.fields.put(vm.alloc, name, vm.peek(0));
@@ -1415,13 +1397,13 @@ pub const VM = struct {
                     vm.push(value);
                 },
                 .DelProperty => {
-                    const instance = vm.peek(0).asInstance() orelse {
+                    const instance = vm.peek(0).as(Instance) orelse {
                         return vm.runtimeError("Only instances have properties.\n", .{});
                     };
-                    const name = frame.constant().asString() orelse {
+                    const name = frame.constant().as(String) orelse {
                         return vm.runtimeError("Tried to access a non-string property!\n", .{});
                     };
-                    vm.push(.{ .bool = instance.fields.remove(name) });
+                    vm.push(Value.boolean(instance.fields.remove(name)));
                 },
             }
         }
@@ -1488,7 +1470,7 @@ pub const VM = struct {
             if (comptime debug.LogGC) {
                 std.debug.print("  Interned: {s}\n", .{str.chars});
             }
-            vm.push(.{ .obj = string });
+            vm.push(Value.object(string));
             return string;
         }
 
@@ -1501,8 +1483,8 @@ pub const VM = struct {
     }
 
     fn callValue(vm: *VM, value: Value, argCount: usize) !*CallFrame {
-        switch (value) {
-            .obj => switch (value.obj.*) {
+        if (value.asObject()) |obj| {
+            switch (obj.*) {
                 .closure => |*closure| {
                     return try vm.call(closure, argCount);
                 },
@@ -1520,8 +1502,8 @@ pub const VM = struct {
                     return try vm.call(bound.method, argCount);
                 },
                 .class => |*class| {
-                    const obj = try vm.createObject(.{ .instance = .{ .class = class } });
-                    vm.stack[vm.stackTop - (argCount + 1)] = .{ .obj = obj };
+                    const object = try vm.createObject(.{ .instance = .{ .class = class } });
+                    vm.stack[vm.stackTop - (argCount + 1)] = Value.object(object);
                     if (class.init) |initializer| {
                         return try vm.call(initializer, argCount);
                     } else if (argCount != 0) {
@@ -1531,10 +1513,9 @@ pub const VM = struct {
                     return &vm.frames[vm.frameCount - 1];
                 },
                 else => return vm.runtimeError("Can only call functions and classes!\n", .{}),
-            },
-            else => {
-                return vm.runtimeError("Can only call functions and classes!\n", .{});
-            },
+            }
+        } else {
+            return vm.runtimeError("Can only call functions and classes!\n", .{});
         }
     }
 
@@ -1643,20 +1624,17 @@ pub const VM = struct {
             .Subtract => Value{ .float = a - b },
             .Multiply => Value{ .float = a * b },
             .Divide => Value{ .float = a / b },
-            .Greater => Value{ .bool = a > b },
-            .Less => Value{ .bool = a < b },
+            .Greater => Value.boolean(a > b),
+            .Less => Value.boolean(a < b),
             else => unreachable,
         };
         vm.push(res);
     }
 
     // Requires the top two values to be strings.
-    fn concatenate(vm: *VM) !void {
-        const b = vm.peek(0);
-        const a = vm.peek(1);
-
-        const first = a.obj.*.string.chars;
-        const second = b.obj.*.string.chars;
+    fn concatenate(vm: *VM, a: *const String, b: *const String) !void {
+        const first = a.chars;
+        const second = b.chars;
         var result = try vm.alloc.alloc(u8, first.len + second.len);
         errdefer vm.alloc.free(result);
 
@@ -1676,7 +1654,7 @@ pub const VM = struct {
         if (entry.found_existing) {
             // Free old allocation.
             vm.alloc.free(result);
-            vm.push(Value{ .obj = entry.value_ptr.* });
+            vm.push(Value.object(entry.value_ptr.*));
         } else {
             entry.value_ptr.* = o;
         }
@@ -1693,7 +1671,7 @@ pub const VM = struct {
 
     fn pushObj(vm: *VM, object: Object) !*Object {
         const obj = try vm.createObject(object);
-        vm.push(Value{ .obj = obj });
+        vm.push(Value.object(obj));
         return obj;
     }
 
@@ -2730,7 +2708,7 @@ const Parser = struct {
         const obj = try parser.alloc.create(Object);
         errdefer parser.alloc.destroy(obj);
         obj.* = Object{ .function = func };
-        const index = try parser.writer.makeConstant(Value{ .obj = obj });
+        const index = try parser.writer.makeConstant(Value.object(obj));
         try parser.writer.emitOp(.Closure);
         try parser.writer.emit(index);
 
