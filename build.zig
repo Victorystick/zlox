@@ -21,6 +21,11 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
+    const nanBoxing = b.option(bool, "nan-boxing", "whether to enable nan-boxing; default false") orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "nanBoxing", nanBoxing);
+
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Zig modules are the preferred way of making Zig code available to consumers.
@@ -40,6 +45,7 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    mod.addOptions("build_options", build_options);
 
     // Create a Wasm module that can interpret Lox scripts.
     const wasm = b.addExecutable(.{

@@ -1,16 +1,143 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
+const build_options = @import("build_options");
 
 const debug = .{
     .PrintBytecode = false,
     .TraceExecution = false,
+    .Err = false,
     // Must be false in Wasm since it relies on std.debug.print, which is not
     // available in that target.
     .StressGC = false,
     .LogGC = false,
 };
 
-pub const Value = TaggedValue;
+pub const Value = if (build_options.nanBoxing) NanTaggedValue else TaggedValue;
+
+test "value size" {
+    // I saw a ~3% slowdown using the NanTaggedValue, despite its smaller
+    // size. For this reason, I've disabled it by default.
+    try std.testing.expectEqual(@sizeOf(NanTaggedValue), 8);
+    try std.testing.expectEqual(@sizeOf(TaggedValue), 16);
+}
+
+const NanTaggedValue = struct {
+    const Self = @This();
+
+    float: f64,
+
+    const QNAN: u64 = 0x7ffc000000000000;
+    /// The object tag.
+    const SIGN_BIT: u64 = 0x8000000000000000;
+    const NIL_BITS: u64 = QNAN | 1;
+    const FALSE_BITS: u64 = QNAN | 2;
+    const TRUE_BITS: u64 = QNAN | 3;
+    const nil: NanTaggedValue = .fromBits(NIL_BITS);
+    const nan: NanTaggedValue = .fromBits(QNAN);
+
+    /// A wrapper around object creation.
+    pub fn object(obj: *Object) NanTaggedValue {
+        const original: u64 = @intFromPtr(obj);
+        if (((~(SIGN_BIT | QNAN)) & original) != original) {
+            // std.debug.print("BAD PTR!!\n", .{});
+            unreachable;
+        }
+        return .fromBits(SIGN_BIT | QNAN | original);
+    }
+
+    /// A wrapper around boolean creation.
+    pub fn boolean(b: bool) NanTaggedValue {
+        return .fromBits(if (b) TRUE_BITS else FALSE_BITS);
+    }
+
+    fn fromBits(bits: u64) Self {
+        return .{ .float = @bitCast(bits) };
+    }
+
+    fn asBits(self: Self) u64 {
+        return @bitCast(self.float);
+    }
+
+    pub fn deinit(self: Self, alloc: std.mem.Allocator) void {
+        if (self.as(Object)) |obj| {
+            obj.deinit(alloc);
+            alloc.destroy(obj);
+        }
+    }
+
+    pub fn format(self: Self, writer: *std.Io.Writer) !void {
+        if (self.isNumber()) {
+            return writer.print("{d}", .{self.float});
+        } else if (self.asObject()) |obj| {
+            return obj.format(writer);
+        } else if (self.asBits() == TRUE_BITS) {
+            return writer.writeAll("true");
+        } else if (self.asBits() == FALSE_BITS) {
+            return writer.writeAll("false");
+        } else if (self.asBits() == NIL_BITS) {
+            return writer.writeAll("nil");
+        } else {
+            unreachable;
+        }
+    }
+
+    fn equals(self: Self, other: Self) bool {
+        // Special case for `NaN == NaN => false`.
+        if (self.isNumber() and other.isNumber()) {
+            return self.float == other.float;
+        }
+        return self.asBits() == other.asBits();
+    }
+
+    fn isFalsey(self: Self) bool {
+        return self.asBits() == NIL_BITS or self.asBits() == FALSE_BITS;
+    }
+
+    fn isNumber(self: Self) bool {
+        return (self.asBits() & QNAN) != QNAN;
+    }
+
+    fn asObject(self: Self) ?*Object {
+        if ((self.asBits() & (SIGN_BIT | QNAN)) == (SIGN_BIT | QNAN)) {
+            return @ptrFromInt(self.asBits() & ~(SIGN_BIT | QNAN));
+        } else {
+            return null;
+        }
+    }
+
+    /// Returns the value as `ty`, or null.
+    fn as(self: Self, comptime ty: type) ?*ty {
+        if (ty == Object) return self.asObject();
+        return if (self.asObject()) |obj| obj.as(ty) else null;
+    }
+
+    test "falsy" {
+        try std.testing.expect(NanTaggedValue.nil.isFalsey());
+        try std.testing.expect(NanTaggedValue.boolean(false).isFalsey());
+        try std.testing.expect(!NanTaggedValue.boolean(true).isFalsey());
+    }
+};
+
+test "equal" {
+    const T = NanTaggedValue.boolean(true);
+    const F = NanTaggedValue.boolean(false);
+
+    try std.testing.expect(!T.equals(F));
+    try std.testing.expect(!T.equals(.nil));
+
+    const zero: f64 = 0;
+    const NaN = Value{ .float = 0 / zero };
+    try std.testing.expect(!NaN.equals(NaN));
+}
+
+test "to/from object identity" {
+    const ptr: *Object = try std.testing.allocator.create(Object);
+    defer std.testing.allocator.destroy(ptr);
+
+    const value = NanTaggedValue.object(ptr);
+    const obj = value.asObject() orelse unreachable;
+    try std.testing.expectEqual(obj, ptr);
+}
 
 const ValueType = enum {
     nil,
@@ -37,12 +164,9 @@ const TaggedValue = union(ValueType) {
     }
 
     pub fn deinit(self: Self, alloc: std.mem.Allocator) void {
-        switch (self) {
-            .obj => |obj| {
-                obj.deinit(alloc);
-                alloc.destroy(obj);
-            },
-            else => {},
+        if (self.as(Object)) |obj| {
+            obj.deinit(alloc);
+            alloc.destroy(obj);
         }
     }
 
@@ -63,7 +187,7 @@ const TaggedValue = union(ValueType) {
             .nil => true,
             .float => |fl| fl == other.float,
             .bool => |b| b == other.bool,
-            .obj => |o| o.equals(other.obj.*),
+            .obj => |o| o.equals(other.obj),
         };
     }
 
@@ -82,16 +206,6 @@ const TaggedValue = union(ValueType) {
         };
     }
 
-    fn isString(self: Self) bool {
-        return switch (self) {
-            .obj => switch (self.obj.*) {
-                .string => true,
-                else => false,
-            },
-            else => false,
-        };
-    }
-
     fn asObject(self: Self) ?*Object {
         return switch (self) {
             .obj => |obj| obj,
@@ -101,15 +215,8 @@ const TaggedValue = union(ValueType) {
 
     /// Returns the value as `ty`, or null.
     fn as(self: Self, comptime ty: type) ?*ty {
-        return switch (self) {
-            .obj => |obj| obj.as(ty),
-            inline else => |*val| {
-                if (comptime @TypeOf(val.*) == ty) {
-                    return val;
-                }
-                return null;
-            },
-        };
+        if (ty == Object) return self.asObject();
+        return if (self.asObject()) |obj| obj.as(ty) else null;
     }
 };
 
@@ -371,7 +478,7 @@ const Object = union(ObjectType) {
         };
     }
 
-    fn equals(self: Object, other: Object) bool {
+    fn equals(self: *const Object, other: *const Object) bool {
         return std.meta.eql(self, other);
     }
 };
@@ -1258,10 +1365,6 @@ pub const VM = struct {
                 },
                 .Greater => try vm.binop(.Greater),
                 .Less => try vm.binop(.Less),
-                _ => {
-                    try vm.io.flush();
-                    return error.RuntimeError;
-                },
                 .Print => try vm.io.print("{f}\n", .{vm.pop()}),
                 .Pop => _ = vm.pop(),
                 .JumpIfFalse => {
@@ -1405,6 +1508,7 @@ pub const VM = struct {
                     };
                     vm.push(Value.boolean(instance.fields.remove(name)));
                 },
+                else => return vm.runtimeError("Unknown opcode!\n", .{}),
             }
         }
 
@@ -3289,7 +3393,7 @@ fn bench(source: []const u8) !void {
     try vm.defineNative("run", struct {
         fn run(it: *VM, _: []Value) NativeErr!Value {
             const go = std.Io.Clock.now(.awake, std.testing.io).nanoseconds < it.benchmarkEndTime.nanoseconds;
-            return .{ .bool = go };
+            return Value.boolean(go);
         }
     }.run);
 

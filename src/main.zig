@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
             const res = try in.interface.takeSentinel('\n');
             std.debug.print("\n", .{});
 
-            _ = try vm.interpret(res);
+            vm.interpret(res) catch {};
         }
     }
 }
